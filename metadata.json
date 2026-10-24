@@ -1,0 +1,6 @@
+{
+  "name": "OpenIndex - Google URL Indexing & Multi-Account Rotation",
+  "description": "Automate Google URL indexing with multi-project service account rotation, quota tracking, 429 auto-failover, and Supabase PostgreSQL integration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
