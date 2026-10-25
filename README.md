@@ -14,8 +14,8 @@ The PostgreSQL schema consists of two tables defined in `schema.sql`:
 - **`url_logs`**: Detailed log table recording each URL request, status (`SUCCESS`, `FAILED`, `QUOTA_EXHAUSTED`), HTTP status code, and the specific account ID and project name used.
 
 ### 2. Authentication Gate
-- **Step 1**: Admin password verification (`ADMIN_PASSWORD`, default: `admin123`).
-- **Step 2**: 10-digit OTP challenge (`OTP_CODE`, default: `0123456789`).
+- **Step 1**: Admin password verification (`ADMIN_PASSWORD`).
+- **Step 2**: 10-digit OTP challenge (`OTP_CODE`).
 - Issues signed session cookies and tokens.
 
 ### 3. Service Account Uploader
