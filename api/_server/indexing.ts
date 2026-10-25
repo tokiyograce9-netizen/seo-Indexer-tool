@@ -1,6 +1,6 @@
 import { google } from 'googleapis';
-import { db } from './db';
-import { IndexResultItem, BatchSummary, ServiceAccount } from '../lib/types';
+import { db } from './db.js';
+import { IndexResultItem, BatchSummary, ServiceAccount } from '../../src/lib/types.js';
 
 const DAILY_QUOTA_LIMIT = parseInt(process.env.DAILY_QUOTA_PER_ACCOUNT || '200', 10);
 

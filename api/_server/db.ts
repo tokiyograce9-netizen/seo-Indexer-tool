@@ -1,7 +1,7 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import fs from 'fs';
 import path from 'path';
-import { ServiceAccount, UrlLog, SystemStatus } from '../lib/types';
+import { ServiceAccount, UrlLog, SystemStatus } from '../../src/lib/types.js';
 import crypto from 'crypto';
 
 // Detect Serverless environment (Vercel, AWS Lambda, Netlify)

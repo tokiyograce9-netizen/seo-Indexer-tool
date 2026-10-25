@@ -3,20 +3,20 @@ import cookieParser from 'cookie-parser';
 import dotenv from 'dotenv';
 import path from 'path';
 import fs from 'fs';
-import { db } from './db';
+import { db } from './db.js';
 import {
   handleLogin,
   handleVerifyOtp,
   handleCheckSession,
   handleLogout,
   requireAuth,
-} from './auth';
+} from './auth.js';
 import {
   executeBulkIndexing,
   testServiceAccountKey,
   verifyUrlForIndexing,
-} from './indexing';
-import { ServiceAccount, ServiceAccountCredentials } from '../lib/types';
+} from './indexing.js';
+import { ServiceAccount, ServiceAccountCredentials } from '../../src/lib/types.js';
 
 dotenv.config();
 

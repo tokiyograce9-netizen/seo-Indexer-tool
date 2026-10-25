@@ -1,5 +1,5 @@
 import type { Request, Response } from 'express';
-import app from '../src/server/app';
+import app from './_server/app.js';
 
 export default function handler(req: Request, res: Response) {
   try {
