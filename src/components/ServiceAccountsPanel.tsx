@@ -13,21 +13,22 @@ import {
   Sparkles,
   HelpCircle,
   ExternalLink,
+  Edit3,
+  FileCheck,
 } from 'lucide-react';
 import { ServiceAccount } from '../lib/types';
+import { apiFetch } from '../lib/api';
 
 interface ServiceAccountsPanelProps {
   accounts: ServiceAccount[];
   loading: boolean;
   onRefresh: () => void;
-  onOpenSchemaModal: () => void;
 }
 
 export const ServiceAccountsPanel: React.FC<ServiceAccountsPanelProps> = ({
   accounts,
   loading,
   onRefresh,
-  onOpenSchemaModal,
 }) => {
   const [dragOver, setDragOver] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -35,10 +36,18 @@ export const ServiceAccountsPanel: React.FC<ServiceAccountsPanelProps> = ({
   const [rawJsonText, setRawJsonText] = useState('');
   const [uploadMessage, setUploadMessage] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
   const [testingId, setTestingId] = useState<string | null>(null);
-  const [testResult, setTestResult] = useState<{ id: string; success: boolean; message: string } | null>(null);
+  const [testResult, setTestResult] = useState<{ id: string; success: boolean; message: string; details?: any } | null>(null);
   const [copiedEmail, setCopiedEmail] = useState<string | null>(null);
   const [seeding, setSeeding] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Edit / Reupload Modal State
+  const [editingAccount, setEditingAccount] = useState<ServiceAccount | null>(null);
+  const [editProjectName, setEditProjectName] = useState('');
+  const [editJsonText, setEditJsonText] = useState('');
+  const [reuploadFileLoading, setReuploadFileLoading] = useState(false);
+  const [editMessage, setEditMessage] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
+  const editFileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFiles = async (fileList: FileList) => {
     setUploading(true);
@@ -62,7 +71,7 @@ export const ServiceAccountsPanel: React.FC<ServiceAccountsPanelProps> = ({
         throw new Error('No valid .json Google Cloud service account key files selected.');
       }
 
-      const res = await fetch('/api/accounts/upload', {
+      const res = await apiFetch('/api/accounts/upload', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ files: parsedFiles }),
@@ -89,7 +98,7 @@ export const ServiceAccountsPanel: React.FC<ServiceAccountsPanelProps> = ({
     setUploadMessage(null);
     try {
       const json = JSON.parse(rawJsonText);
-      const res = await fetch('/api/accounts/upload', {
+      const res = await apiFetch('/api/accounts/upload', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ rawJson: json }),
@@ -110,7 +119,7 @@ export const ServiceAccountsPanel: React.FC<ServiceAccountsPanelProps> = ({
 
   const toggleAccount = async (id: string) => {
     try {
-      const res = await fetch(`/api/accounts/${id}/toggle`, { method: 'PATCH' });
+      const res = await apiFetch(`/api/accounts/${id}/toggle`, { method: 'PATCH' });
       if (res.ok) {
         onRefresh();
       }
@@ -123,12 +132,13 @@ export const ServiceAccountsPanel: React.FC<ServiceAccountsPanelProps> = ({
     setTestingId(id);
     setTestResult(null);
     try {
-      const res = await fetch(`/api/accounts/${id}/test`, { method: 'POST' });
+      const res = await apiFetch(`/api/accounts/${id}/test`, { method: 'POST' });
       const data = await res.json();
       setTestResult({
         id,
         success: data.success,
         message: data.message,
+        details: data.details,
       });
     } catch (err: any) {
       setTestResult({
@@ -143,7 +153,7 @@ export const ServiceAccountsPanel: React.FC<ServiceAccountsPanelProps> = ({
 
   const resetQuota = async (id: string) => {
     try {
-      const res = await fetch(`/api/accounts/${id}/reset-quota`, { method: 'POST' });
+      const res = await apiFetch(`/api/accounts/${id}/reset-quota`, { method: 'POST' });
       if (res.ok) {
         onRefresh();
       }
@@ -155,7 +165,7 @@ export const ServiceAccountsPanel: React.FC<ServiceAccountsPanelProps> = ({
   const deleteAccount = async (id: string) => {
     if (!confirm('Are you sure you want to remove this service account?')) return;
     try {
-      const res = await fetch(`/api/accounts/${id}`, { method: 'DELETE' });
+      const res = await apiFetch(`/api/accounts/${id}`, { method: 'DELETE' });
       if (res.ok) {
         onRefresh();
       }
@@ -164,18 +174,61 @@ export const ServiceAccountsPanel: React.FC<ServiceAccountsPanelProps> = ({
     }
   };
 
-  const seedDemoAccounts = async () => {
-    setSeeding(true);
+  const openEditModal = (acc: ServiceAccount) => {
+    setEditingAccount(acc);
+    setEditProjectName(acc.project_name);
+    setEditJsonText('');
+    setEditMessage(null);
+  };
+
+  const handleEditReuploadFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setReuploadFileLoading(true);
+    setEditMessage(null);
     try {
-      const res = await fetch('/api/accounts/demo-seed', { method: 'POST' });
-      if (res.ok) {
-        setUploadMessage({ text: 'Loaded 3 realistic demo accounts for preview!', type: 'success' });
-        onRefresh();
-      }
+      const text = await file.text();
+      const json = JSON.parse(text);
+      setEditJsonText(JSON.stringify(json, null, 2));
+      if (json.project_id) setEditProjectName(json.project_id);
+      setEditMessage({ text: `File "${file.name}" loaded ready to save.`, type: 'success' });
     } catch (err: any) {
-      setUploadMessage({ text: err.message, type: 'error' });
+      setEditMessage({ text: 'Invalid JSON file: ' + err.message, type: 'error' });
     } finally {
-      setSeeding(false);
+      setReuploadFileLoading(false);
+    }
+  };
+
+  const handleSaveAccountEdit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingAccount) return;
+    setReuploadFileLoading(true);
+    setEditMessage(null);
+
+    try {
+      let payload: any = { project_name: editProjectName.trim() };
+      if (editJsonText.trim()) {
+        payload.rawJson = editJsonText.trim();
+      }
+
+      const res = await apiFetch(`/api/accounts/${editingAccount.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to update account');
+
+      setEditMessage({ text: 'Account updated successfully!', type: 'success' });
+      setTimeout(() => {
+        setEditingAccount(null);
+        onRefresh();
+      }, 900);
+    } catch (err: any) {
+      setEditMessage({ text: err.message, type: 'error' });
+    } finally {
+      setReuploadFileLoading(false);
     }
   };
 
@@ -192,25 +245,14 @@ export const ServiceAccountsPanel: React.FC<ServiceAccountsPanelProps> = ({
         <div>
           <h2 className="text-lg font-bold text-white flex items-center gap-2">
             <Layers className="w-5 h-5 text-emerald-400" />
-            Service Accounts Pool ({accounts.length})
+            Connected Service Accounts ({accounts.length})
           </h2>
           <p className="text-xs text-neutral-400 mt-0.5">
-            Connect infinite Google Cloud projects to automatically rotate past Google's 200/day limit.
+            Manage attached JSON keys, edit project names, reupload credentials, and monitor daily quotas.
           </p>
         </div>
 
         <div className="flex items-center gap-2 self-start sm:self-auto">
-          {accounts.length === 0 && (
-            <button
-              onClick={seedDemoAccounts}
-              disabled={seeding}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-purple-500/10 hover:bg-purple-500/20 border border-purple-500/30 text-xs font-medium text-purple-300 transition-colors cursor-pointer"
-            >
-              <Sparkles className="w-3.5 h-3.5 text-purple-400" />
-              {seeding ? 'Generating...' : 'Seed Demo Keys'}
-            </button>
-          )}
-
           <button
             onClick={() => setPasteMode(!pasteMode)}
             className="px-3 py-1.5 rounded-xl bg-neutral-800 hover:bg-neutral-700 text-xs text-neutral-300 transition-colors cursor-pointer"
@@ -283,7 +325,7 @@ export const ServiceAccountsPanel: React.FC<ServiceAccountsPanelProps> = ({
             value={rawJsonText}
             onChange={(e) => setRawJsonText(e.target.value)}
             rows={5}
-            placeholder={`{\n  "type": "service_account",\n  "project_id": "my-gcp-project",\n  "private_key": "-----BEGIN RSA PRIVATE KEY-----\\n...",\n  "client_email": "my-indexer@my-gcp-project.iam.gserviceaccount.com"\n}`}
+            placeholder={`{\n  "type": "service_account",\n  "project_id": "seo-automation-503206",\n  "private_key": "-----BEGIN PRIVATE KEY-----\\n...",\n  "client_email": "seo-automation@seo-automation-503206.iam.gserviceaccount.com"\n}`}
             className="w-full bg-neutral-900 border border-neutral-800 rounded-xl p-3 text-xs font-mono text-emerald-300 placeholder-neutral-600 focus:outline-none focus:border-emerald-500"
           />
           <div className="flex justify-end gap-2">
@@ -337,8 +379,19 @@ export const ServiceAccountsPanel: React.FC<ServiceAccountsPanelProps> = ({
             <XCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
           )}
           <div className="flex-1">
-            <p className="font-semibold">{testResult.success ? 'Google Authentication Verified' : 'Authentication Warning'}</p>
+            <p className="font-semibold">{testResult.success ? 'Google Authentication Verified' : 'Action Required in Google Cloud'}</p>
             <p className="text-[11px] opacity-90 mt-0.5 font-mono">{testResult.message}</p>
+            {testResult.details?.enableUrl && (
+              <a
+                href={testResult.details.enableUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1.5 mt-2.5 px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-neutral-950 font-bold text-xs shadow-md transition-colors"
+              >
+                <ExternalLink className="w-3.5 h-3.5" />
+                Enable Web Search Indexing API in Google Cloud
+              </a>
+            )}
           </div>
           <button
             onClick={() => setTestResult(null)}
@@ -355,15 +408,8 @@ export const ServiceAccountsPanel: React.FC<ServiceAccountsPanelProps> = ({
           <Key className="w-8 h-8 text-neutral-600 mx-auto mb-2" />
           <p className="text-sm font-semibold text-neutral-300">No service accounts registered yet</p>
           <p className="text-xs text-neutral-500 max-w-md mx-auto mt-1 mb-4">
-            Upload your Google Cloud service account JSON keys above or click "Seed Demo Keys" to test the automated rotation engine.
+            Upload your Google Cloud service account JSON keys above to begin indexing.
           </p>
-          <button
-            onClick={seedDemoAccounts}
-            className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 text-xs font-medium hover:bg-emerald-500/20 transition-all cursor-pointer"
-          >
-            <Sparkles className="w-3.5 h-3.5" />
-            Seed Demo Accounts for Instant Testing
-          </button>
         </div>
       ) : (
         <div className="space-y-3">
@@ -392,14 +438,20 @@ export const ServiceAccountsPanel: React.FC<ServiceAccountsPanelProps> = ({
                       <span className="font-semibold text-sm text-white font-mono">
                         {acc.project_name}
                       </span>
+                      {acc.has_credentials && (
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-mono uppercase bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 flex items-center gap-1">
+                          <FileCheck className="w-3 h-3" />
+                          Key Attached
+                        </span>
+                      )}
                       {isExhausted && (
                         <span className="px-2 py-0.5 rounded-full text-[10px] font-mono uppercase bg-amber-500/10 text-amber-400 border border-amber-500/20">
-                          Quota Exhausted (200/200)
+                          Quota Exhausted ({used}/{limit})
                         </span>
                       )}
                       {!acc.is_active && (
                         <span className="px-2 py-0.5 rounded-full text-[10px] font-mono uppercase bg-neutral-800 text-neutral-400">
-                          Inactive
+                          Paused
                         </span>
                       )}
                     </div>
@@ -424,7 +476,7 @@ export const ServiceAccountsPanel: React.FC<ServiceAccountsPanelProps> = ({
                   </div>
 
                   {/* Quota Progress */}
-                  <div className="w-full md:w-56">
+                  <div className="w-full md:w-52">
                     <div className="flex justify-between items-center text-xs mb-1">
                       <span className="text-neutral-400">Daily Quota:</span>
                       <span className="font-mono text-neutral-200">
@@ -449,7 +501,17 @@ export const ServiceAccountsPanel: React.FC<ServiceAccountsPanelProps> = ({
                   </div>
 
                   {/* Actions */}
-                  <div className="flex items-center gap-2 self-end md:self-auto">
+                  <div className="flex items-center gap-1.5 self-end md:self-auto flex-wrap">
+                    {/* Edit / Reupload Key */}
+                    <button
+                      onClick={() => openEditModal(acc)}
+                      className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-200 text-xs font-medium transition-colors cursor-pointer"
+                      title="Edit project name or reupload/replace JSON key"
+                    >
+                      <Edit3 className="w-3.5 h-3.5 text-cyan-400" />
+                      <span>Edit Key</span>
+                    </button>
+
                     {/* Test Button */}
                     <button
                       onClick={() => testAccount(acc.id)}
@@ -460,17 +522,17 @@ export const ServiceAccountsPanel: React.FC<ServiceAccountsPanelProps> = ({
                       {testingId === acc.id ? (
                         <RefreshCw className="w-3.5 h-3.5 animate-spin" />
                       ) : (
-                        'Test Key'
+                        'Test'
                       )}
                     </button>
 
                     {/* Reset Quota */}
                     <button
                       onClick={() => resetQuota(acc.id)}
-                      className="px-2.5 py-1.5 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-xs transition-colors cursor-pointer"
+                      className="px-2 py-1.5 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-xs transition-colors cursor-pointer"
                       title="Reset daily usage counter back to 0"
                     >
-                      Reset 0/200
+                      Reset
                     </button>
 
                     {/* Active Toggle */}
@@ -502,13 +564,127 @@ export const ServiceAccountsPanel: React.FC<ServiceAccountsPanelProps> = ({
         </div>
       )}
 
+      {/* Edit / Reupload Key Modal */}
+      {editingAccount && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-md animate-fadeIn">
+          <div className="bg-neutral-900 border border-neutral-800 rounded-2xl max-w-lg w-full p-6 shadow-2xl relative">
+            <div className="flex items-center justify-between pb-3 border-b border-neutral-800 mb-4">
+              <h3 className="font-bold text-white text-sm flex items-center gap-2">
+                <Edit3 className="w-4 h-4 text-cyan-400" />
+                Manage & Reupload Service Account Key
+              </h3>
+              <button
+                onClick={() => setEditingAccount(null)}
+                className="text-neutral-400 hover:text-white text-sm cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveAccountEdit} className="space-y-4 text-xs">
+              <div>
+                <label className="text-neutral-400 font-semibold block mb-1">
+                  Project Name / ID:
+                </label>
+                <input
+                  type="text"
+                  value={editProjectName}
+                  onChange={(e) => setEditProjectName(e.target.value)}
+                  className="w-full bg-neutral-950 border border-neutral-800 rounded-xl px-3 py-2 text-white font-mono outline-none focus:border-cyan-500"
+                />
+              </div>
+
+              <div>
+                <label className="text-neutral-400 font-semibold block mb-1">
+                  Current Client Email:
+                </label>
+                <div className="p-2.5 rounded-xl bg-neutral-950 border border-neutral-800 text-neutral-300 font-mono text-[11px] truncate">
+                  {editingAccount.client_email}
+                </div>
+              </div>
+
+              {/* Reupload File input */}
+              <div>
+                <label className="text-neutral-400 font-semibold block mb-1">
+                  Reupload / Replace with New .JSON Key File:
+                </label>
+                <input
+                  type="file"
+                  ref={editFileInputRef}
+                  onChange={handleEditReuploadFile}
+                  accept=".json,application/json"
+                  className="hidden"
+                />
+                <button
+                  type="button"
+                  onClick={() => editFileInputRef.current?.click()}
+                  className="w-full border border-dashed border-neutral-700 hover:border-cyan-400 rounded-xl p-3 text-center bg-neutral-950 hover:bg-cyan-500/5 transition-all text-neutral-300 cursor-pointer flex items-center justify-center gap-2"
+                >
+                  <Upload className="w-4 h-4 text-cyan-400" />
+                  <span>Choose Replacement .JSON Key File...</span>
+                </button>
+              </div>
+
+              {/* Paste Raw Key Option */}
+              <div>
+                <label className="text-neutral-400 font-semibold block mb-1">
+                  Or Paste New Service Account JSON Object:
+                </label>
+                <textarea
+                  rows={4}
+                  value={editJsonText}
+                  onChange={(e) => setEditJsonText(e.target.value)}
+                  placeholder="Paste replacement JSON key payload here to update private_key or email..."
+                  className="w-full bg-neutral-950 border border-neutral-800 rounded-xl p-2.5 text-[11px] font-mono text-emerald-300 outline-none focus:border-cyan-500"
+                />
+              </div>
+
+              {editMessage && (
+                <div
+                  className={`p-2.5 rounded-xl text-xs flex items-center gap-2 ${
+                    editMessage.type === 'success'
+                      ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                      : 'bg-red-500/10 text-red-400 border border-red-500/20'
+                  }`}
+                >
+                  {editMessage.type === 'success' ? (
+                    <CheckCircle className="w-4 h-4 shrink-0" />
+                  ) : (
+                    <XCircle className="w-4 h-4 shrink-0" />
+                  )}
+                  <span>{editMessage.text}</span>
+                </div>
+              )}
+
+              <div className="pt-2 flex justify-end gap-2 border-t border-neutral-800">
+                <button
+                  type="button"
+                  onClick={() => setEditingAccount(null)}
+                  className="px-3 py-1.5 rounded-xl bg-neutral-800 hover:bg-neutral-700 text-neutral-300 font-medium cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={reuploadFileLoading}
+                  className="px-4 py-1.5 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-neutral-950 font-bold cursor-pointer disabled:opacity-50"
+                >
+                  {reuploadFileLoading ? 'Saving...' : 'Save & Update Key'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
       {/* Helpful Search Console Reminder Box */}
       <div className="mt-6 p-4 rounded-xl bg-neutral-950/70 border border-neutral-800/80 flex items-start gap-3">
         <HelpCircle className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
         <div className="text-xs text-neutral-400 leading-relaxed">
-          <strong className="text-neutral-200">Important Google Search Console Requirement:</strong>
+          <strong className="text-neutral-200">Where Does Google Index Your Links?</strong>
           <span className="block mt-0.5">
-            For Google to accept indexing requests without a <code>403 Permission Denied</code> error, each service account's <code>client_email</code> must be added as an <strong>Owner</strong> or <strong>Full User</strong> under <em>Settings &rarr; Users and permissions</em> inside Google Search Console for your website property.
+            Your service account email (<code>seo-automation@seo-automation-503206.iam.gserviceaccount.com</code>) pushes requests directly to the <strong>Google Indexing API</strong>. Once Googlebot crawls the page, it reflects in the global Google Search index!
+            Make sure this email is added as an <strong>Owner</strong> in Google Search Console for your website property (e.g. <code>https://yourwebsite.com/</code>).
           </span>
         </div>
       </div>

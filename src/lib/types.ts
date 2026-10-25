@@ -23,6 +23,7 @@ export interface ServiceAccount {
   is_active: boolean;
   created_at: string;
   updated_at?: string;
+  has_credentials?: boolean;
   status_info?: string;
 }
 
@@ -42,6 +43,7 @@ export interface IndexBatchRequest {
   urls: string[];
   notificationType?: 'URL_UPDATED' | 'URL_DELETED';
   dryRun?: boolean;
+  quotaLimit?: number; // 100 or 200 URLs per account
 }
 
 export interface IndexResultItem {
@@ -69,9 +71,23 @@ export interface SystemStatus {
   storageMode: 'supabase' | 'local_fallback';
   totalAccounts: number;
   activeAccounts: number;
+  quotaLimitPerAccount: number; // 100 or 200
   totalDailyQuota: number;
   usedDailyQuota: number;
   remainingDailyQuota: number;
   adminPasswordConfigured: boolean;
   defaultOtpConfigured: boolean;
+}
+
+export interface UrlVerificationResult {
+  url: string;
+  statusCode: number;
+  isAccessible: boolean;
+  title: string | null;
+  hasNoIndex: boolean;
+  canonicalUrl: string | null;
+  googleSearchUrl: string;
+  googleSearchConsoleUrl: string;
+  domain: string;
+  recommendations: string[];
 }

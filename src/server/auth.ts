@@ -1,9 +1,9 @@
 import { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
-const OTP_CODE = process.env.OTP_CODE || '0123456789';
-const SESSION_SECRET = process.env.SESSION_SECRET || 'openindex-secure-session-key-2025';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'seo.8268';
+const OTP_CODE = process.env.OTP_CODE || '6307500844';
+const SESSION_SECRET = process.env.SESSION_SECRET || 'seo-indexer-secure-session-key-2025';
 
 // Memory store for active sessions and pending OTP attempts
 const activeSessions = new Set<string>();
@@ -61,7 +61,6 @@ export function handleLogin(req: Request, res: Response) {
     step: 'OTP_REQUIRED',
     challengeId,
     message: 'Password accepted. Please enter your 10-digit OTP.',
-    defaultOtpHint: process.env.NODE_ENV !== 'production' ? '0123456789' : undefined,
   });
 }
 
@@ -74,7 +73,7 @@ export function handleVerifyOtp(req: Request, res: Response) {
 
   const cleanOtp = String(otp || '').trim();
   if (cleanOtp !== OTP_CODE) {
-    return res.status(401).json({ error: 'Invalid 10-digit OTP code. Default is 0123456789' });
+    return res.status(401).json({ error: 'Invalid 10-digit OTP code.' });
   }
 
   // Consume challenge

@@ -12,6 +12,7 @@ import {
   Info,
 } from 'lucide-react';
 import { UrlLog } from '../lib/types';
+import { apiFetch } from '../lib/api';
 
 interface LogsTableProps {
   logs: UrlLog[];
@@ -39,7 +40,7 @@ export const LogsTable: React.FC<LogsTableProps> = ({
     if (!confirm('Are you sure you want to clear all URL indexing history?')) return;
     setClearing(true);
     try {
-      const res = await fetch('/api/logs', { method: 'DELETE' });
+      const res = await apiFetch('/api/logs', { method: 'DELETE' });
       if (res.ok) {
         onRefresh();
       }
@@ -313,10 +314,33 @@ export const LogsTable: React.FC<LogsTableProps> = ({
               </div>
 
               {selectedLog.http_code === 403 && (
-                <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-300 text-[11px] leading-relaxed">
-                  <strong>How to fix 403 Permission Denied:</strong>
-                  <br />
-                  Open <a href="https://search.google.com/search-console" target="_blank" rel="noreferrer" className="underline font-bold">Google Search Console</a> &rarr; Select your property &rarr; Go to Settings &rarr; Users and permissions &rarr; Click <em>Add user</em> &rarr; Paste the service account's <code>client_email</code> and grant <strong>Owner</strong> permission.
+                <div className="p-3.5 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-300 text-[11px] leading-relaxed space-y-2">
+                  {selectedLog.response_message?.includes('Google Cloud API Disabled') ||
+                  selectedLog.response_message?.includes('is NOT enabled') ||
+                  selectedLog.response_message?.includes('is DISABLED') ? (
+                    <div>
+                      <strong className="text-amber-200 block mb-1">Root Cause: Web Search Indexing API Disabled in Google Cloud</strong>
+                      <p className="text-neutral-300 mb-2">
+                        Even if the service account is added in Google Search Console, Google Cloud blocks all requests until the Web Search Indexing API is enabled for this project.
+                      </p>
+                      <a
+                        href={`https://console.developers.google.com/apis/api/indexing.googleapis.com/overview?project=${selectedLog.used_project_name || 'seo-automation-503206'}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-neutral-950 font-bold text-xs transition-colors"
+                      >
+                        <ExternalLink className="w-3.5 h-3.5" />
+                        Enable Web Search Indexing API in Google Cloud
+                      </a>
+                    </div>
+                  ) : (
+                    <div>
+                      <strong className="text-amber-200 block mb-1">Search Console Ownership Required:</strong>
+                      <p className="text-neutral-300">
+                        Open <a href="https://search.google.com/search-console" target="_blank" rel="noreferrer" className="underline font-bold text-white">Google Search Console</a> &rarr; Select your property &rarr; Go to Settings &rarr; Users and permissions &rarr; Click <em>Add user</em> &rarr; Paste the service account's <code>client_email</code> and grant <strong>Owner</strong> permission.
+                      </p>
+                    </div>
+                  )}
                 </div>
               )}
             </div>

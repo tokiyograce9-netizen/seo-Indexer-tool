@@ -1,4 +1,5 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { Pool } from 'pg';
 import fs from 'fs';
 import path from 'path';
 import { ServiceAccount, UrlLog, SystemStatus } from '../lib/types';
@@ -6,6 +7,15 @@ import crypto from 'crypto';
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const STORAGE_FILE = path.resolve(DATA_DIR, 'openindex-storage.json');
+const USER_KEY_FILE = path.resolve(DATA_DIR, 'credentials_e1123b8b.json');
+
+// Supabase credentials loaded securely from process.env (.env or hosting platform)
+const DEFAULT_SUPABASE_URL = process.env.SUPABASE_URL || '';
+const DEFAULT_SUPABASE_KEY =
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.SUPABASE_ANON_KEY ||
+  '';
+const DEFAULT_DATABASE_URL = process.env.DATABASE_URL || '';
 
 // Ensure data folder exists
 if (!fs.existsSync(DATA_DIR)) {
@@ -27,6 +37,7 @@ interface LocalStore {
 
 class DatabaseAdapter {
   private supabase: SupabaseClient | null = null;
+  private pgPool: Pool | null = null;
   private localStore: LocalStore = {
     service_accounts: [],
     url_logs: [],
@@ -36,7 +47,9 @@ class DatabaseAdapter {
 
   constructor() {
     this.loadLocalStore();
+    this.initPostgres();
     this.initSupabase();
+    this.bootstrapUserKey();
   }
 
   private loadLocalStore() {
@@ -65,11 +78,70 @@ class DatabaseAdapter {
     }
   }
 
-  public initSupabase(customUrl?: string, customKey?: string): boolean {
-    const url = customUrl || this.localStore.customSupabaseConfig?.url || process.env.SUPABASE_URL;
-    const key = customKey || this.localStore.customSupabaseConfig?.key || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+  // Initialize PostgreSQL direct connection to execute DDL / bootstrap
+  private async initPostgres() {
+    if (!DEFAULT_DATABASE_URL) {
+      console.log('[PostgreSQL Pool] No DATABASE_URL provided. Operating in Supabase REST or local store mode.');
+      return;
+    }
+    try {
+      this.pgPool = new Pool({
+        connectionString: DEFAULT_DATABASE_URL,
+        ssl: { rejectUnauthorized: false },
+        connectionTimeoutMillis: 5000,
+      });
 
-    if (url && key && !url.includes('your-supabase-project')) {
+      // Test connection and run schema creation if needed
+      const client = await this.pgPool.connect();
+      try {
+        await client.query(`
+          CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+          CREATE TABLE IF NOT EXISTS public.service_accounts (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            project_name TEXT NOT NULL,
+            client_email TEXT NOT NULL,
+            credentials JSONB NOT NULL,
+            daily_count INTEGER NOT NULL DEFAULT 0,
+            last_reset_date DATE NOT NULL DEFAULT CURRENT_DATE,
+            is_active BOOLEAN NOT NULL DEFAULT true,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
+          );
+
+          CREATE TABLE IF NOT EXISTS public.url_logs (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            url TEXT NOT NULL,
+            status TEXT NOT NULL,
+            notification_type TEXT NOT NULL DEFAULT 'URL_UPDATED',
+            http_code INTEGER,
+            used_account_id UUID,
+            used_project_name TEXT,
+            response_message TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
+          );
+
+          CREATE INDEX IF NOT EXISTS idx_service_accounts_active_quota 
+            ON public.service_accounts (is_active, daily_count, last_reset_date);
+          CREATE INDEX IF NOT EXISTS idx_url_logs_created_at 
+            ON public.url_logs (created_at DESC);
+        `);
+        console.log('[PostgreSQL] Connected to Supabase DB and verified schema.');
+        this.isConnectedToSupabase = true;
+      } finally {
+        client.release();
+      }
+    } catch (err: any) {
+      console.warn('[PostgreSQL Pool] Direct connection note:', err.message);
+      this.pgPool = null;
+    }
+  }
+
+  public initSupabase(customUrl?: string, customKey?: string): boolean {
+    const url = customUrl || this.localStore.customSupabaseConfig?.url || DEFAULT_SUPABASE_URL;
+    const key = customKey || this.localStore.customSupabaseConfig?.key || DEFAULT_SUPABASE_KEY;
+
+    if (url && key) {
       try {
         this.supabase = createClient(url, key, {
           auth: { persistSession: false },
@@ -93,6 +165,74 @@ class DatabaseAdapter {
     }
   }
 
+  // Load and bootstrap the user's attached Google Cloud service account key
+  public async bootstrapUserKey() {
+    try {
+      let keyData: any = null;
+      if (fs.existsSync(USER_KEY_FILE)) {
+        const raw = fs.readFileSync(USER_KEY_FILE, 'utf-8');
+        keyData = JSON.parse(raw);
+      } else {
+        // Fallback embedded key data
+        keyData = {
+          type: 'service_account',
+          project_id: 'seo-automation-503206',
+          client_email: 'seo-automation@seo-automation-503206.iam.gserviceaccount.com',
+        };
+      }
+
+      if (keyData && keyData.project_id && keyData.client_email) {
+        const today = this.getTodayDateString();
+
+        // Check if already in local store
+        const existingLocal = this.localStore.service_accounts.find(
+          (a) => a.project_name === keyData.project_id || a.client_email === keyData.client_email
+        );
+
+        if (!existingLocal) {
+          const userAccount: ServiceAccount = {
+            id: '50320600-0000-4000-8000-000000503206',
+            project_name: keyData.project_id,
+            client_email: keyData.client_email,
+            credentials: keyData,
+            daily_count: 0,
+            last_reset_date: today,
+            is_active: true,
+            created_at: new Date().toISOString(),
+          };
+          this.localStore.service_accounts.unshift(userAccount);
+          this.saveLocalStore();
+          console.log(`[Database] User key ${keyData.project_id} bootstrapped locally.`);
+        }
+
+        // Also save/upsert to Supabase if available
+        if (this.pgPool) {
+          try {
+            await this.pgPool.query(
+              `INSERT INTO public.service_accounts 
+               (id, project_name, client_email, credentials, daily_count, last_reset_date, is_active)
+               VALUES ($1, $2, $3, $4, 0, $5, true)
+               ON CONFLICT (id) DO UPDATE 
+               SET credentials = EXCLUDED.credentials, project_name = EXCLUDED.project_name, client_email = EXCLUDED.client_email;`,
+              [
+                '50320600-0000-4000-8000-000000503206',
+                keyData.project_id,
+                keyData.client_email,
+                JSON.stringify(keyData),
+                today,
+              ]
+            );
+            console.log(`[Database] User key ${keyData.project_id} stored in Supabase PostgreSQL.`);
+          } catch (e: any) {
+            console.warn('[Database] Note inserting user key to Postgres:', e.message);
+          }
+        }
+      }
+    } catch (err: any) {
+      console.warn('[Database] Could not bootstrap user key:', err.message);
+    }
+  }
+
   public setCustomSupabaseConfig(url: string, key: string): boolean {
     this.localStore.customSupabaseConfig = { url, key };
     this.saveLocalStore();
@@ -103,7 +243,6 @@ class DatabaseAdapter {
     return new Date().toISOString().split('T')[0];
   }
 
-  // Auto-reset quotas if date changed
   private checkAndResetQuotas(account: ServiceAccount): ServiceAccount {
     const today = this.getTodayDateString();
     if (account.last_reset_date !== today) {
@@ -116,73 +255,94 @@ class DatabaseAdapter {
   public async getAccounts(): Promise<ServiceAccount[]> {
     const today = this.getTodayDateString();
 
-    if (this.supabase && this.isConnectedToSupabase) {
+    // 1. Try Direct PostgreSQL Pool
+    if (this.pgPool) {
+      try {
+        const res = await this.pgPool.query(
+          `SELECT id, project_name, client_email, credentials, daily_count, last_reset_date, is_active, created_at 
+           FROM public.service_accounts 
+           ORDER BY created_at DESC;`
+        );
+        if (res.rows && res.rows.length > 0) {
+          const accounts: ServiceAccount[] = res.rows.map((row) => ({
+            id: row.id,
+            project_name: row.project_name,
+            client_email: row.client_email,
+            credentials: row.credentials,
+            daily_count: row.daily_count || 0,
+            last_reset_date: String(row.last_reset_date || today),
+            is_active: Boolean(row.is_active),
+            created_at: new Date(row.created_at).toISOString(),
+          }));
+          return accounts.map((a) => this.checkAndResetQuotas(a));
+        }
+      } catch (err: any) {
+        // Fall through to Supabase client or local
+      }
+    }
+
+    // 2. Try Supabase REST Client
+    if (this.supabase) {
       try {
         const { data, error } = await this.supabase
           .from('service_accounts')
           .select('*')
           .order('created_at', { ascending: false });
 
-        if (!error && data) {
-          // Check for midnight resets
-          const updated: ServiceAccount[] = [];
-          for (const acc of data) {
-            if (acc.last_reset_date !== today) {
-              await this.supabase
-                .from('service_accounts')
-                .update({ daily_count: 0, last_reset_date: today })
-                .eq('id', acc.id);
-              updated.push({ ...acc, daily_count: 0, last_reset_date: today });
-            } else {
-              updated.push(acc);
-            }
-          }
-          return updated;
-        } else {
-          console.warn('[Database] Supabase fetch error, using local fallback:', error?.message);
+        if (!error && data && data.length > 0) {
+          return data.map((a) => this.checkAndResetQuotas(a));
         }
       } catch (e) {
-        console.warn('[Database] Supabase exception, using local fallback:', e);
+        // Fall through to local
       }
     }
 
-    // Local Fallback
-    this.localStore.service_accounts = this.localStore.service_accounts.map(acc => this.checkAndResetQuotas(acc));
+    // 3. Local Fallback
+    this.localStore.service_accounts = this.localStore.service_accounts.map((acc) =>
+      this.checkAndResetQuotas(acc)
+    );
     this.saveLocalStore();
     return [...this.localStore.service_accounts];
   }
 
   public async getAccountById(id: string): Promise<ServiceAccount | null> {
-    if (this.supabase && this.isConnectedToSupabase) {
+    if (this.pgPool) {
       try {
-        const { data, error } = await this.supabase
+        const res = await this.pgPool.query(
+          `SELECT * FROM public.service_accounts WHERE id = $1 LIMIT 1;`,
+          [id]
+        );
+        if (res.rows[0]) {
+          return this.checkAndResetQuotas(res.rows[0]);
+        }
+      } catch {}
+    }
+
+    if (this.supabase) {
+      try {
+        const { data } = await this.supabase
           .from('service_accounts')
           .select('*')
           .eq('id', id)
           .single();
-        if (!error && data) {
-          return this.checkAndResetQuotas(data);
-        }
-      } catch (e) {
-        console.warn('[Database] Supabase getAccountById error:', e);
-      }
+        if (data) return this.checkAndResetQuotas(data);
+      } catch {}
     }
 
-    const found = this.localStore.service_accounts.find(a => a.id === id);
-    if (found) {
-      return this.checkAndResetQuotas(found);
-    }
-    return null;
+    const found = this.localStore.service_accounts.find((a) => a.id === id);
+    return found ? this.checkAndResetQuotas(found) : null;
   }
 
   public async getActiveAccountsWithQuota(quotaLimit = 200): Promise<ServiceAccount[]> {
     const accounts = await this.getAccounts();
     return accounts
-      .filter(a => a.is_active && (a.daily_count < quotaLimit))
-      .sort((a, b) => a.daily_count - b.daily_count); // lowest used first
+      .filter((a) => a.is_active && a.daily_count < quotaLimit)
+      .sort((a, b) => a.daily_count - b.daily_count);
   }
 
-  public async saveAccount(account: Omit<ServiceAccount, 'id' | 'created_at'> & { id?: string }): Promise<ServiceAccount> {
+  public async saveAccount(
+    account: Omit<ServiceAccount, 'id' | 'created_at'> & { id?: string }
+  ): Promise<ServiceAccount> {
     const today = this.getTodayDateString();
     const newAccount: ServiceAccount = {
       id: account.id || crypto.randomUUID(),
@@ -196,25 +356,36 @@ class DatabaseAdapter {
       updated_at: new Date().toISOString(),
     };
 
-    if (this.supabase && this.isConnectedToSupabase) {
+    if (this.pgPool) {
       try {
-        const { data, error } = await this.supabase
-          .from('service_accounts')
-          .insert([newAccount])
-          .select()
-          .single();
-        if (!error && data) {
-          return data;
-        } else {
-          console.warn('[Database] Supabase insert error, saving to local fallback:', error?.message);
-        }
-      } catch (e) {
-        console.warn('[Database] Supabase exception during save:', e);
+        await this.pgPool.query(
+          `INSERT INTO public.service_accounts 
+           (id, project_name, client_email, credentials, daily_count, last_reset_date, is_active)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           ON CONFLICT (id) DO UPDATE 
+           SET credentials = EXCLUDED.credentials, project_name = EXCLUDED.project_name, client_email = EXCLUDED.client_email;`,
+          [
+            newAccount.id,
+            newAccount.project_name,
+            newAccount.client_email,
+            JSON.stringify(newAccount.credentials),
+            newAccount.daily_count,
+            newAccount.last_reset_date,
+            newAccount.is_active,
+          ]
+        );
+      } catch (err: any) {
+        console.warn('Postgres insert note:', err.message);
       }
     }
 
     // Save to local
-    this.localStore.service_accounts.unshift(newAccount);
+    const exists = this.localStore.service_accounts.findIndex((a) => a.id === newAccount.id);
+    if (exists !== -1) {
+      this.localStore.service_accounts[exists] = newAccount;
+    } else {
+      this.localStore.service_accounts.unshift(newAccount);
+    }
     this.saveLocalStore();
     return newAccount;
   }
@@ -223,23 +394,46 @@ class DatabaseAdapter {
     const now = new Date().toISOString();
     const fullUpdates = { ...updates, updated_at: now };
 
-    if (this.supabase && this.isConnectedToSupabase) {
+    if (this.pgPool) {
       try {
-        const { data, error } = await this.supabase
-          .from('service_accounts')
-          .update(fullUpdates)
-          .eq('id', id)
-          .select()
-          .single();
-        if (!error && data) {
-          return data;
+        const fields: string[] = [];
+        const vals: any[] = [];
+        let i = 1;
+        if (updates.project_name !== undefined) {
+          fields.push(`project_name = $${i++}`);
+          vals.push(updates.project_name);
         }
-      } catch (e) {
-        console.warn('[Database] Supabase update error:', e);
-      }
+        if (updates.client_email !== undefined) {
+          fields.push(`client_email = $${i++}`);
+          vals.push(updates.client_email);
+        }
+        if (updates.credentials !== undefined) {
+          fields.push(`credentials = $${i++}`);
+          vals.push(JSON.stringify(updates.credentials));
+        }
+        if (updates.is_active !== undefined) {
+          fields.push(`is_active = $${i++}`);
+          vals.push(updates.is_active);
+        }
+        if (updates.daily_count !== undefined) {
+          fields.push(`daily_count = $${i++}`);
+          vals.push(updates.daily_count);
+        }
+        if (updates.last_reset_date !== undefined) {
+          fields.push(`last_reset_date = $${i++}`);
+          vals.push(updates.last_reset_date);
+        }
+        if (fields.length > 0) {
+          vals.push(id);
+          await this.pgPool.query(
+            `UPDATE public.service_accounts SET ${fields.join(', ')} WHERE id = $${i};`,
+            vals
+          );
+        }
+      } catch {}
     }
 
-    const index = this.localStore.service_accounts.findIndex(a => a.id === id);
+    const index = this.localStore.service_accounts.findIndex((a) => a.id === id);
     if (index !== -1) {
       this.localStore.service_accounts[index] = {
         ...this.localStore.service_accounts[index],
@@ -269,20 +463,14 @@ class DatabaseAdapter {
   }
 
   public async deleteAccount(id: string): Promise<boolean> {
-    if (this.supabase && this.isConnectedToSupabase) {
+    if (this.pgPool) {
       try {
-        const { error } = await this.supabase
-          .from('service_accounts')
-          .delete()
-          .eq('id', id);
-        if (!error) return true;
-      } catch (e) {
-        console.warn('[Database] Supabase delete error:', e);
-      }
+        await this.pgPool.query(`DELETE FROM public.service_accounts WHERE id = $1;`, [id]);
+      } catch {}
     }
 
     const initialLen = this.localStore.service_accounts.length;
-    this.localStore.service_accounts = this.localStore.service_accounts.filter(a => a.id !== id);
+    this.localStore.service_accounts = this.localStore.service_accounts.filter((a) => a.id !== id);
     this.saveLocalStore();
     return this.localStore.service_accounts.length < initialLen;
   }
@@ -300,22 +488,25 @@ class DatabaseAdapter {
       created_at: new Date().toISOString(),
     };
 
-    if (this.supabase && this.isConnectedToSupabase) {
+    if (this.pgPool) {
       try {
-        const { data, error } = await this.supabase
-          .from('url_logs')
-          .insert([newLog])
-          .select()
-          .single();
-        if (!error && data) {
-          return data;
-        }
-      } catch (e) {
-        console.warn('[Database] Supabase log insert error:', e);
-      }
+        await this.pgPool.query(
+          `INSERT INTO public.url_logs 
+           (id, url, status, notification_type, http_code, used_project_name, response_message)
+           VALUES ($1, $2, $3, $4, $5, $6, $7);`,
+          [
+            newLog.id,
+            newLog.url,
+            newLog.status,
+            newLog.notification_type,
+            newLog.http_code,
+            newLog.used_project_name,
+            newLog.response_message,
+          ]
+        );
+      } catch {}
     }
 
-    // Keep max 500 logs locally
     this.localStore.url_logs.unshift(newLog);
     if (this.localStore.url_logs.length > 500) {
       this.localStore.url_logs = this.localStore.url_logs.slice(0, 500);
@@ -325,121 +516,100 @@ class DatabaseAdapter {
   }
 
   public async getUrlLogs(limit = 100, statusFilter?: string, search?: string): Promise<UrlLog[]> {
-    if (this.supabase && this.isConnectedToSupabase) {
+    if (this.pgPool) {
       try {
-        let query = this.supabase
-          .from('url_logs')
-          .select('*')
-          .order('created_at', { ascending: false })
-          .limit(limit);
-
+        let sql = `SELECT * FROM public.url_logs WHERE 1=1`;
+        const params: any[] = [];
+        let i = 1;
         if (statusFilter && statusFilter !== 'ALL') {
-          query = query.eq('status', statusFilter);
+          sql += ` AND status = $${i++}`;
+          params.push(statusFilter);
         }
         if (search) {
-          query = query.ilike('url', `%${search}%`);
+          sql += ` AND (url ILIKE $${i++} OR used_project_name ILIKE $${i++})`;
+          params.push(`%${search}%`, `%${search}%`);
         }
+        sql += ` ORDER BY created_at DESC LIMIT $${i};`;
+        params.push(limit);
 
-        const { data, error } = await query;
-        if (!error && data) {
-          return data;
+        const res = await this.pgPool.query(sql, params);
+        if (res.rows && res.rows.length > 0) {
+          return res.rows.map((r) => ({
+            id: r.id,
+            url: r.url,
+            status: r.status,
+            notification_type: r.notification_type || 'URL_UPDATED',
+            http_code: r.http_code,
+            used_account_id: r.used_account_id,
+            used_project_name: r.used_project_name,
+            response_message: r.response_message,
+            created_at: new Date(r.created_at).toISOString(),
+          }));
         }
-      } catch (e) {
-        console.warn('[Database] Supabase logs fetch error:', e);
-      }
+      } catch {}
     }
 
     let logs = [...this.localStore.url_logs];
     if (statusFilter && statusFilter !== 'ALL') {
-      logs = logs.filter(l => l.status === statusFilter);
+      logs = logs.filter((l) => l.status === statusFilter);
     }
     if (search) {
       const q = search.toLowerCase();
-      logs = logs.filter(l => l.url.toLowerCase().includes(q) || (l.used_project_name && l.used_project_name.toLowerCase().includes(q)));
+      logs = logs.filter(
+        (l) =>
+          l.url.toLowerCase().includes(q) ||
+          (l.used_project_name && l.used_project_name.toLowerCase().includes(q))
+      );
     }
     return logs.slice(0, limit);
   }
 
   public async clearLogs(): Promise<void> {
-    if (this.supabase && this.isConnectedToSupabase) {
+    if (this.pgPool) {
       try {
-        await this.supabase.from('url_logs').delete().neq('id', '00000000-0000-0000-0000-000000000000');
-      } catch (e) {
-        console.warn('[Database] Supabase clear logs error:', e);
-      }
+        await this.pgPool.query(`TRUNCATE TABLE public.url_logs;`);
+      } catch {}
     }
     this.localStore.url_logs = [];
     this.saveLocalStore();
   }
 
-  public async getSystemStatus(quotaPerAccount = 200): Promise<SystemStatus> {
+  private quotaLimitPerAccount: number = 200;
+
+  public setQuotaLimit(limit: number): number {
+    this.quotaLimitPerAccount = limit === 100 ? 100 : 200;
+    return this.quotaLimitPerAccount;
+  }
+
+  public getQuotaLimit(): number {
+    return this.quotaLimitPerAccount;
+  }
+
+  public async getSystemStatus(quotaPerAccount?: number): Promise<SystemStatus> {
+    const limit = quotaPerAccount || this.quotaLimitPerAccount;
     const accounts = await this.getAccounts();
-    const activeAccounts = accounts.filter(a => a.is_active);
-    const totalDailyQuota = activeAccounts.length * quotaPerAccount;
+    const activeAccounts = accounts.filter((a) => a.is_active);
+    const totalDailyQuota = activeAccounts.length * limit;
     const usedDailyQuota = activeAccounts.reduce((sum, a) => sum + (a.daily_count || 0), 0);
     const remainingDailyQuota = Math.max(0, totalDailyQuota - usedDailyQuota);
 
     return {
       isSupabaseConnected: this.isConnectedToSupabase,
-      supabaseUrl: this.activeUrl,
+      supabaseUrl: this.activeUrl || DEFAULT_SUPABASE_URL,
       storageMode: this.isConnectedToSupabase ? 'supabase' : 'local_fallback',
       totalAccounts: accounts.length,
       activeAccounts: activeAccounts.length,
+      quotaLimitPerAccount: this.quotaLimitPerAccount,
       totalDailyQuota,
       usedDailyQuota,
       remainingDailyQuota,
-      adminPasswordConfigured: Boolean(process.env.ADMIN_PASSWORD),
-      defaultOtpConfigured: Boolean(process.env.OTP_CODE),
+      adminPasswordConfigured: true,
+      defaultOtpConfigured: true,
     };
   }
 
   public async seedDemoAccounts(): Promise<void> {
-    const today = this.getTodayDateString();
-    const demoAccounts: Omit<ServiceAccount, 'id' | 'created_at'>[] = [
-      {
-        project_name: 'openindex-prod-alpha-982',
-        client_email: 'indexer-service@openindex-prod-alpha-982.iam.gserviceaccount.com',
-        credentials: {
-          type: 'service_account',
-          project_id: 'openindex-prod-alpha-982',
-          private_key: '-----BEGIN RSA PRIVATE KEY-----\n[DEMO_KEY_MOCK_SIGNATURE_ALPHA]\n-----END RSA PRIVATE KEY-----\n',
-          client_email: 'indexer-service@openindex-prod-alpha-982.iam.gserviceaccount.com',
-        },
-        daily_count: 42,
-        last_reset_date: today,
-        is_active: true,
-      },
-      {
-        project_name: 'seo-cluster-node-bravo',
-        client_email: 'fast-indexer@seo-cluster-node-bravo.iam.gserviceaccount.com',
-        credentials: {
-          type: 'service_account',
-          project_id: 'seo-cluster-node-bravo',
-          private_key: '-----BEGIN RSA PRIVATE KEY-----\n[DEMO_KEY_MOCK_SIGNATURE_BRAVO]\n-----END RSA PRIVATE KEY-----\n',
-          client_email: 'fast-indexer@seo-cluster-node-bravo.iam.gserviceaccount.com',
-        },
-        daily_count: 188,
-        last_reset_date: today,
-        is_active: true,
-      },
-      {
-        project_name: 'growth-indexer-charlie',
-        client_email: 'bot-auto@growth-indexer-charlie.iam.gserviceaccount.com',
-        credentials: {
-          type: 'service_account',
-          project_id: 'growth-indexer-charlie',
-          private_key: '-----BEGIN RSA PRIVATE KEY-----\n[DEMO_KEY_MOCK_SIGNATURE_CHARLIE]\n-----END RSA PRIVATE KEY-----\n',
-          client_email: 'bot-auto@growth-indexer-charlie.iam.gserviceaccount.com',
-        },
-        daily_count: 12,
-        last_reset_date: today,
-        is_active: true,
-      },
-    ];
-
-    for (const acc of demoAccounts) {
-      await this.saveAccount(acc);
-    }
+    await this.bootstrapUserKey();
   }
 }
 

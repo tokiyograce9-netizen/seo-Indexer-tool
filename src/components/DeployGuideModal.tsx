@@ -345,7 +345,7 @@ DAILY_QUOTA_PER_ACCOUNT="200"`,
                   Connect Google Cloud & Search Console
                 </h4>
                 <p className="text-neutral-400 text-xs leading-relaxed">
-                  Enable the <strong>Web Search Indexing API</strong> in Google Cloud Console. Create service account(s) and download the <code>.json</code> key(s). Add each service account email as an <strong>Owner</strong> in Google Search Console for your site. Then drop the JSON keys into OpenIndex!
+                  Enable the <strong>Web Search Indexing API</strong> in Google Cloud Console. Create service account(s) and download the <code>.json</code> key(s). Add each service account email as an <strong>Owner</strong> in Google Search Console for your site. Then drop the JSON keys into SEO INDEXER!
                 </p>
               </div>
             </div>

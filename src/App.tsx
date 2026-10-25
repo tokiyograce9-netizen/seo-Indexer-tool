@@ -1,16 +1,20 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { AuthGate } from './components/AuthGate';
 import { Header } from './components/Header';
 import { StatsCards } from './components/StatsCards';
 import { BulkIndexingPanel } from './components/BulkIndexingPanel';
 import { ServiceAccountsPanel } from './components/ServiceAccountsPanel';
 import { LogsTable } from './components/LogsTable';
-import { SupabaseModal } from './components/SupabaseModal';
-import { DeployGuideModal } from './components/DeployGuideModal';
+import { IndexVerifierPanel } from './components/IndexVerifierPanel';
 import { ServiceAccount, UrlLog, SystemStatus } from './lib/types';
+import { apiFetch, clearAuthToken, getAuthToken } from './lib/api';
+
+// Inactivity timeout: 10 minutes of no user interaction
+const INACTIVITY_TIMEOUT_MS = 10 * 60 * 1000;
 
 export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState<boolean | null>(null);
+  const [lockNotice, setLockNotice] = useState<string | null>(null);
   const [status, setStatus] = useState<SystemStatus | null>(null);
   const [accounts, setAccounts] = useState<ServiceAccount[]>([]);
   const [logs, setLogs] = useState<UrlLog[]>([]);
@@ -19,17 +23,28 @@ export default function App() {
   const [statusFilter, setStatusFilter] = useState('ALL');
   const [searchTerm, setSearchTerm] = useState('');
 
-  // Modals
-  const [isSupabaseModalOpen, setIsSupabaseModalOpen] = useState(false);
-  const [isDeployModalOpen, setIsDeployModalOpen] = useState(false);
+  const lastActivityRef = useRef<number>(Date.now());
+  const inactivityTimerRef = useRef<any>(null);
 
-  // Check initial session
+  // Check initial session from sessionStorage
   const checkSession = useCallback(async () => {
+    const token = getAuthToken();
+    if (!token) {
+      setIsAuthenticated(false);
+      return;
+    }
+
     try {
-      const res = await fetch('/api/auth/session');
+      const res = await apiFetch('/api/auth/session');
       const data = await res.json();
-      setIsAuthenticated(Boolean(data.authenticated));
+      if (data.authenticated) {
+        setIsAuthenticated(true);
+      } else {
+        clearAuthToken();
+        setIsAuthenticated(false);
+      }
     } catch {
+      clearAuthToken();
       setIsAuthenticated(false);
     }
   }, []);
@@ -38,10 +53,71 @@ export default function App() {
     checkSession();
   }, [checkSession]);
 
+  // Tab refresh and close session auto-lock trigger
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      // Clear token so refreshing or closing the tab immediately locks the session
+      clearAuthToken();
+      try {
+        navigator.sendBeacon('/api/auth/logout');
+      } catch {}
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+    };
+  }, []);
+
+  // Inactivity auto-lock monitor (10 minutes)
+  const handleLogout = useCallback(async (notice?: string) => {
+    try {
+      await apiFetch('/api/auth/logout', { method: 'POST' });
+    } catch {
+      // ignore
+    }
+    clearAuthToken();
+    setIsAuthenticated(false);
+    if (notice) {
+      setLockNotice(notice);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+
+    const resetInactivityTimer = () => {
+      lastActivityRef.current = Date.now();
+    };
+
+    // User interaction listeners
+    const events = ['mousedown', 'mousemove', 'keydown', 'scroll', 'touchstart'];
+    events.forEach((event) => {
+      window.addEventListener(event, resetInactivityTimer, { passive: true });
+    });
+
+    // Check inactivity every 15 seconds
+    inactivityTimerRef.current = setInterval(() => {
+      const elapsed = Date.now() - lastActivityRef.current;
+      if (elapsed >= INACTIVITY_TIMEOUT_MS) {
+        handleLogout('Session locked due to 10 minutes of inactivity. All your working drafts are saved.');
+      }
+    }, 15000);
+
+    return () => {
+      events.forEach((event) => {
+        window.removeEventListener(event, resetInactivityTimer);
+      });
+      if (inactivityTimerRef.current) {
+        clearInterval(inactivityTimerRef.current);
+      }
+    };
+  }, [isAuthenticated, handleLogout]);
+
   // Load Status
   const fetchStatus = useCallback(async () => {
     try {
-      const res = await fetch('/api/system/status');
+      const res = await apiFetch('/api/system/status');
       if (res.ok) {
         const data = await res.json();
         setStatus(data);
@@ -55,7 +131,7 @@ export default function App() {
   const fetchAccounts = useCallback(async () => {
     setLoadingAccounts(true);
     try {
-      const res = await fetch('/api/accounts');
+      const res = await apiFetch('/api/accounts');
       if (res.ok) {
         const data = await res.json();
         setAccounts(data);
@@ -76,7 +152,7 @@ export default function App() {
       if (searchTerm) query.set('search', searchTerm);
       query.set('limit', '200');
 
-      const res = await fetch(`/api/logs?${query.toString()}`);
+      const res = await apiFetch(`/api/logs?${query.toString()}`);
       if (res.ok) {
         const data = await res.json();
         setLogs(data);
@@ -98,20 +174,10 @@ export default function App() {
   useEffect(() => {
     if (isAuthenticated) {
       refreshAll();
-      // Polling interval every 25 seconds
       const interval = setInterval(refreshAll, 25000);
       return () => clearInterval(interval);
     }
   }, [isAuthenticated, refreshAll]);
-
-  const handleLogout = async () => {
-    try {
-      await fetch('/api/auth/logout', { method: 'POST' });
-    } catch {
-      // ignore
-    }
-    setIsAuthenticated(false);
-  };
 
   // Auth gate check
   if (isAuthenticated === null) {
@@ -126,7 +192,15 @@ export default function App() {
   }
 
   if (!isAuthenticated) {
-    return <AuthGate onAuthenticated={() => setIsAuthenticated(true)} />;
+    return (
+      <AuthGate
+        onAuthenticated={() => {
+          setLockNotice(null);
+          setIsAuthenticated(true);
+        }}
+        lockNotice={lockNotice}
+      />
+    );
   }
 
   // Calculate logs counts
@@ -138,31 +212,28 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-neutral-950 text-neutral-100 flex flex-col font-sans selection:bg-emerald-500/20 selection:text-emerald-300">
-      {/* Top Header */}
-      <Header
-        status={status}
-        onOpenDeployModal={() => setIsDeployModalOpen(true)}
-        onOpenSchemaModal={() => setIsSupabaseModalOpen(true)}
-        onLogout={handleLogout}
-      />
+      {/* Top Header without Supabase/Vercel buttons */}
+      <Header status={status} onLogout={() => handleLogout()} />
 
       {/* Main Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
         {/* System Stats Cards */}
         <StatsCards status={status} logsCount={logsCount} />
 
-        {/* Bulk URL Submission Engine */}
+        {/* Bulk URL Submission Engine (200 URLs/day per account fixed) */}
         <BulkIndexingPanel
           onBatchCompleted={refreshAll}
           activeAccountsCount={status?.activeAccounts ?? 0}
         />
+
+        {/* Live Google Index & SERP Inspector */}
+        <IndexVerifierPanel />
 
         {/* Service Accounts Management & Key Uploader */}
         <ServiceAccountsPanel
           accounts={accounts}
           loading={loadingAccounts}
           onRefresh={refreshAll}
-          onOpenSchemaModal={() => setIsSupabaseModalOpen(true)}
         />
 
         {/* Live Status Response Log Table */}
@@ -177,38 +248,11 @@ export default function App() {
         />
       </main>
 
-      {/* Modals */}
-      <SupabaseModal
-        isOpen={isSupabaseModalOpen}
-        onClose={() => setIsSupabaseModalOpen(false)}
-        status={status}
-        onRefreshStatus={fetchStatus}
-      />
-
-      <DeployGuideModal
-        isOpen={isDeployModalOpen}
-        onClose={() => setIsDeployModalOpen(false)}
-      />
-
       {/* Footer */}
       <footer className="border-t border-neutral-800/80 bg-neutral-950 py-4 text-center text-xs text-neutral-500">
         <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-2">
-          <span>OpenIndex • Production-Ready Google URL Indexing & Automated Multi-Account Rotation</span>
-          <div className="flex items-center gap-3">
-            <button
-              onClick={() => setIsSupabaseModalOpen(true)}
-              className="hover:text-emerald-400 transition-colors cursor-pointer"
-            >
-              Supabase SQL
-            </button>
-            <span>•</span>
-            <button
-              onClick={() => setIsDeployModalOpen(true)}
-              className="hover:text-cyan-400 transition-colors cursor-pointer"
-            >
-              Next.js & Vercel
-            </button>
-          </div>
+          <span>SEO INDEXER • Multi-Account Google URL Indexing & Automated 429 Quota Rotation</span>
+          <span className="font-mono text-[11px] text-neutral-400">PostgreSQL Backend Active</span>
         </div>
       </footer>
     </div>
