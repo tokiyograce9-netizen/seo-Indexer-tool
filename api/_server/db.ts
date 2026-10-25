@@ -55,11 +55,23 @@ class DatabaseAdapter {
   private isConnectedToSupabase = false;
   private activeUrl: string | null = null;
   private quotaLimitPerAccount: number = 200;
+  private initializationPromise: Promise<void> | null = null;
 
   constructor() {
+    // Start initialization but don't block constructor
+    this.initializationPromise = this.initialize();
+  }
+
+  private async initialize() {
     this.initSupabase();
     this.loadLocalStore();
-    this.bootstrapUserKey();
+    await this.bootstrapUserKey();
+  }
+
+  private async ensureInitialized() {
+    if (this.initializationPromise) {
+      await this.initializationPromise;
+    }
   }
 
   private loadLocalStore() {
@@ -101,7 +113,6 @@ class DatabaseAdapter {
         });
         this.activeUrl = url;
         this.isConnectedToSupabase = true;
-        console.log(`[Database] Supabase client initialized via HTTPS REST with ${url}`);
         return true;
       } catch (err) {
         console.warn('[Database] Failed to init Supabase client:', err);
@@ -142,6 +153,7 @@ class DatabaseAdapter {
 
       if (keyData && keyData.project_id && keyData.client_email) {
         const today = this.getTodayDateString();
+        const bootstrapId = '50320600-0000-4000-8000-000000503206';
 
         // Check if already present in Supabase
         if (this.supabase) {
@@ -149,12 +161,14 @@ class DatabaseAdapter {
             const { data } = await this.supabase
               .from('service_accounts')
               .select('id, project_name')
-              .eq('project_name', keyData.project_id)
-              .maybeSingle();
+              .or(`id.eq.${bootstrapId},project_name.eq.${keyData.project_id}`)
+              .limit(1);
 
-            if (!data) {
+            const existing = data?.[0];
+
+            if (!existing) {
               await this.supabase.from('service_accounts').insert({
-                id: '50320600-0000-4000-8000-000000503206',
+                id: bootstrapId,
                 project_name: keyData.project_id,
                 client_email: keyData.client_email,
                 credentials: keyData,
@@ -163,6 +177,19 @@ class DatabaseAdapter {
                 is_active: true,
               });
               console.log(`[Database] Bootstrapped user account into Supabase PostgreSQL.`);
+            } else {
+              // Ensure credentials are up to date in Supabase if it's the bootstrapped one
+              // We use upsert here to be safe and ensure the ID matches
+              await this.supabase.from('service_accounts').upsert({
+                id: existing.id || bootstrapId,
+                project_name: keyData.project_id,
+                client_email: keyData.client_email,
+                credentials: keyData,
+                daily_count: 0,
+                last_reset_date: today,
+                is_active: true,
+                updated_at: new Date().toISOString()
+              });
             }
           } catch (e: any) {
             console.warn('[Database] Supabase bootstrap notice:', e.message);
@@ -171,11 +198,11 @@ class DatabaseAdapter {
 
         // Also preserve in local store
         const existingLocal = this.localStore.service_accounts.find(
-          (a) => a.project_name === keyData.project_id || a.client_email === keyData.client_email
+          (a) => a.id === bootstrapId || a.project_name === keyData.project_id
         );
         if (!existingLocal) {
           const userAccount: ServiceAccount = {
-            id: '50320600-0000-4000-8000-000000503206',
+            id: bootstrapId,
             project_name: keyData.project_id,
             client_email: keyData.client_email,
             credentials: keyData,
@@ -193,7 +220,8 @@ class DatabaseAdapter {
     }
   }
 
-  public setCustomSupabaseConfig(url: string, key: string): boolean {
+  public async setCustomSupabaseConfig(url: string, key: string): Promise<boolean> {
+    await this.ensureInitialized();
     this.localStore.customSupabaseConfig = { url, key };
     this.saveLocalStore();
     return this.initSupabase(url, key);
@@ -213,6 +241,7 @@ class DatabaseAdapter {
   }
 
   public async getAccounts(): Promise<ServiceAccount[]> {
+    await this.ensureInitialized();
     const today = this.getTodayDateString();
 
     // 1. Primary: Supabase REST API
@@ -223,18 +252,22 @@ class DatabaseAdapter {
           .select('*')
           .order('created_at', { ascending: false });
 
-        if (!error && Array.isArray(data) && data.length > 0) {
-          const accounts: ServiceAccount[] = data.map((row) => ({
-            id: row.id,
-            project_name: row.project_name,
-            client_email: row.client_email,
-            credentials: row.credentials,
-            daily_count: Number(row.daily_count || 0),
-            last_reset_date: String(row.last_reset_date || today),
-            is_active: Boolean(row.is_active),
-            created_at: row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString(),
-          }));
-          return accounts.map((a) => this.checkAndResetQuotas(a));
+        if (!error && Array.isArray(data)) {
+          // If Supabase has data, it is the source of truth
+          if (data.length > 0) {
+            const accounts: ServiceAccount[] = data.map((row) => ({
+              id: row.id,
+              project_name: row.project_name,
+              client_email: row.client_email,
+              credentials: row.credentials,
+              daily_count: Number(row.daily_count || 0),
+              last_reset_date: String(row.last_reset_date || today),
+              is_active: Boolean(row.is_active),
+              created_at: row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString(),
+            }));
+            return accounts.map((a) => this.checkAndResetQuotas(a));
+          }
+          // If Supabase is connected but empty, fall through to check if we should bootstrap again
         }
       } catch (err: any) {
         console.warn('[Database] Supabase getAccounts notice:', err.message);
@@ -250,6 +283,7 @@ class DatabaseAdapter {
   }
 
   public async getAccountById(id: string): Promise<ServiceAccount | null> {
+    await this.ensureInitialized();
     if (this.supabase) {
       try {
         const { data, error } = await this.supabase
@@ -287,6 +321,7 @@ class DatabaseAdapter {
   public async saveAccount(
     account: Omit<ServiceAccount, 'id' | 'created_at'> & { id?: string }
   ): Promise<ServiceAccount> {
+    await this.ensureInitialized();
     const today = this.getTodayDateString();
     const newAccount: ServiceAccount = {
       id: account.id || crypto.randomUUID(),
@@ -330,6 +365,7 @@ class DatabaseAdapter {
   }
 
   public async updateAccount(id: string, updates: Partial<ServiceAccount>): Promise<ServiceAccount | null> {
+    await this.ensureInitialized();
     const now = new Date().toISOString();
     const fullUpdates = { ...updates, updated_at: now };
 
@@ -374,6 +410,7 @@ class DatabaseAdapter {
   }
 
   public async deleteAccount(id: string): Promise<boolean> {
+    await this.ensureInitialized();
     if (this.supabase) {
       try {
         await this.supabase.from('service_accounts').delete().eq('id', id);
@@ -389,6 +426,7 @@ class DatabaseAdapter {
   }
 
   public async addUrlLog(log: Omit<UrlLog, 'id' | 'created_at'>): Promise<UrlLog> {
+    await this.ensureInitialized();
     const newLog: UrlLog = {
       id: crypto.randomUUID(),
       url: log.url,
@@ -427,6 +465,7 @@ class DatabaseAdapter {
   }
 
   public async getUrlLogs(limit = 100, statusFilter?: string, search?: string): Promise<UrlLog[]> {
+    await this.ensureInitialized();
     if (this.supabase) {
       try {
         let query = this.supabase
@@ -478,6 +517,7 @@ class DatabaseAdapter {
   }
 
   public async clearLogs(): Promise<void> {
+    await this.ensureInitialized();
     if (this.supabase) {
       try {
         await this.supabase
@@ -502,6 +542,7 @@ class DatabaseAdapter {
   }
 
   public async getSystemStatus(quotaPerAccount?: number): Promise<SystemStatus> {
+    await this.ensureInitialized();
     const limit = quotaPerAccount || this.quotaLimitPerAccount;
     const accounts = await this.getAccounts();
     const activeAccounts = accounts.filter((a) => a.is_active);
