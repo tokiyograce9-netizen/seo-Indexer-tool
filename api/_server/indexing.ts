@@ -166,7 +166,7 @@ async function publishUrlToGoogle(
     const messageStr = typeof errorBody === 'object' ? JSON.stringify(errorBody) : String(errorBody);
     const reason = errorObj?.details?.[0]?.reason || errorObj?.errors?.[0]?.reason || '';
     const apiErrorMsg = errorObj?.message || messageStr;
-    const projectId = account.project_name || account.credentials?.project_id || 'seo-automation-503206';
+    const projectId = account.project_name || account.credentials?.project_id || 'unknown-project';
     const enableUrl = `https://console.developers.google.com/apis/api/indexing.googleapis.com/overview?project=${projectId}`;
 
     const isQuota =
@@ -460,7 +460,7 @@ export async function verifyUrlForIndexing(targetUrl: string) {
 
   // Recommendations for Search Console
   recommendations.push(
-    `Make sure your service account email (seo-automation@seo-automation-503206.iam.gserviceaccount.com) is added as an OWNER under Settings -> Users and permissions in Google Search Console for property: ${domainOrigin}`
+    `Make sure your service account email (${account.client_email}) is added as an OWNER under Settings -> Users and permissions in Google Search Console for property: ${domainOrigin}`
   );
   recommendations.push(
     `To verify live indexing on Google: Click 'Check on Google Search (site: operator)'. If Googlebot has crawled it, the search result snippet will appear.`

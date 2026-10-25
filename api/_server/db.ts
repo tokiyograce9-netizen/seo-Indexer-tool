@@ -142,13 +142,9 @@ class DatabaseAdapter {
         }
       } catch {}
 
-      // 2. Fallback project metadata
+      // 2. No hardcoded fallback - must use attached file or Supabase
       if (!keyData) {
-        keyData = {
-          type: 'service_account',
-          project_id: 'seo-automation-503206',
-          client_email: 'seo-automation@seo-automation-503206.iam.gserviceaccount.com',
-        };
+        return;
       }
 
       if (keyData && keyData.project_id && keyData.client_email) {
