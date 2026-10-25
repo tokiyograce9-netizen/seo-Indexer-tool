@@ -17,7 +17,7 @@ import {
   FileCheck,
 } from 'lucide-react';
 import { ServiceAccount } from '../lib/types';
-import { apiFetch } from '../lib/api';
+import { apiFetch, safeJsonParse } from '../lib/api';
 
 interface ServiceAccountsPanelProps {
   accounts: ServiceAccount[];
@@ -77,10 +77,7 @@ export const ServiceAccountsPanel: React.FC<ServiceAccountsPanelProps> = ({
         body: JSON.stringify({ files: parsedFiles }),
       });
 
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to upload service accounts');
-      }
+      const data = await safeJsonParse(res);
 
       setUploadMessage({ text: data.message || `Uploaded ${data.count} accounts`, type: 'success' });
       onRefresh();
@@ -103,8 +100,7 @@ export const ServiceAccountsPanel: React.FC<ServiceAccountsPanelProps> = ({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ rawJson: json }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Upload error');
+      const data = await safeJsonParse(res);
 
       setUploadMessage({ text: data.message || 'Account registered successfully', type: 'success' });
       setRawJsonText('');
@@ -133,7 +129,7 @@ export const ServiceAccountsPanel: React.FC<ServiceAccountsPanelProps> = ({
     setTestResult(null);
     try {
       const res = await apiFetch(`/api/accounts/${id}/test`, { method: 'POST' });
-      const data = await res.json();
+      const data = await safeJsonParse(res);
       setTestResult({
         id,
         success: data.success,
@@ -217,8 +213,7 @@ export const ServiceAccountsPanel: React.FC<ServiceAccountsPanelProps> = ({
         body: JSON.stringify(payload),
       });
 
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Failed to update account');
+      const data = await safeJsonParse(res);
 
       setEditMessage({ text: 'Account updated successfully!', type: 'success' });
       setTimeout(() => {

@@ -7,7 +7,7 @@ import { ServiceAccountsPanel } from './components/ServiceAccountsPanel';
 import { LogsTable } from './components/LogsTable';
 import { IndexVerifierPanel } from './components/IndexVerifierPanel';
 import { ServiceAccount, UrlLog, SystemStatus } from './lib/types';
-import { apiFetch, clearAuthToken, getAuthToken } from './lib/api';
+import { apiFetch, clearAuthToken, getAuthToken, safeJsonParse } from './lib/api';
 
 // Inactivity timeout: 10 minutes of no user interaction
 const INACTIVITY_TIMEOUT_MS = 10 * 60 * 1000;
@@ -36,7 +36,7 @@ export default function App() {
 
     try {
       const res = await apiFetch('/api/auth/session');
-      const data = await res.json();
+      const data = await safeJsonParse(res);
       if (data.authenticated) {
         setIsAuthenticated(true);
       } else {
@@ -119,7 +119,7 @@ export default function App() {
     try {
       const res = await apiFetch('/api/system/status');
       if (res.ok) {
-        const data = await res.json();
+        const data = await safeJsonParse(res);
         setStatus(data);
       }
     } catch (err) {
@@ -133,7 +133,7 @@ export default function App() {
     try {
       const res = await apiFetch('/api/accounts');
       if (res.ok) {
-        const data = await res.json();
+        const data = await safeJsonParse(res);
         setAccounts(data);
       }
     } catch (err) {
@@ -154,7 +154,7 @@ export default function App() {
 
       const res = await apiFetch(`/api/logs?${query.toString()}`);
       if (res.ok) {
-        const data = await res.json();
+        const data = await safeJsonParse(res);
         setLogs(data);
       }
     } catch (err) {

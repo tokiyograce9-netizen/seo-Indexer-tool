@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Send, Globe, RefreshCw, CheckCircle2, AlertTriangle, ShieldCheck, Info, ExternalLink, Copy, Check, ShieldAlert } from 'lucide-react';
 import { BatchSummary } from '../lib/types';
-import { apiFetch } from '../lib/api';
+import { apiFetch, safeJsonParse } from '../lib/api';
 
 const DRAFT_STORAGE_KEY = 'seo_indexer_working_draft';
 
@@ -110,11 +110,7 @@ export const BulkIndexingPanel: React.FC<BulkIndexingPanelProps> = ({
         }),
       });
 
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Batch submission failed');
-      }
-
+      const data = await safeJsonParse(res);
       setBatchResult(data);
       onBatchCompleted();
     } catch (err: any) {

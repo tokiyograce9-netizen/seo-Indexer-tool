@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Database, Copy, Check, ExternalLink, RefreshCw, AlertCircle, CheckCircle2 } from 'lucide-react';
 import { SystemStatus } from '../lib/types';
+import { safeJsonParse } from '../lib/api';
 
 interface SupabaseModalProps {
   isOpen: boolean;
@@ -53,8 +54,7 @@ export const SupabaseModal: React.FC<SupabaseModalProps> = ({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: supabaseUrl.trim(), key: supabaseKey.trim() }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Connection failed');
+      const data = await safeJsonParse(res);
 
       setConnectMessage({ text: data.message, success: data.success });
       onRefreshStatus();

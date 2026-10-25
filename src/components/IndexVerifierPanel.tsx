@@ -12,7 +12,7 @@ import {
   Check,
 } from 'lucide-react';
 import { UrlVerificationResult } from '../lib/types';
-import { apiFetch } from '../lib/api';
+import { apiFetch, safeJsonParse } from '../lib/api';
 
 const LAST_VERIFIED_KEY = 'seo_indexer_last_verified_url';
 
@@ -59,9 +59,7 @@ export const IndexVerifierPanel: React.FC = () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: clean }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Inspection failed');
-
+      const data = await safeJsonParse(res);
       setResult(data);
     } catch (err: any) {
       setError(err.message || 'Verification error');
