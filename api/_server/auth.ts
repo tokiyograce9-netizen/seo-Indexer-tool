@@ -5,8 +5,7 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'seo.8268';
 const OTP_CODE = process.env.OTP_CODE || '6307500844';
 const SESSION_SECRET = process.env.SESSION_SECRET || 'seo-indexer-secure-session-key-2025';
 
-// Memory store for active sessions and pending OTP attempts
-const activeSessions = new Set<string>();
+// Memory store for pending OTP attempts
 const pendingOtpChallenges = new Map<string, { createdAt: number }>();
 
 function generateToken(payload: string): string {
@@ -29,7 +28,7 @@ function verifyToken(token: string): boolean {
     if (Date.now() - data.t > 7 * 24 * 60 * 60 * 1000) {
       return false;
     }
-    return activeSessions.has(token);
+    return true;
   } catch {
     return false;
   }
@@ -82,7 +81,6 @@ export function handleVerifyOtp(req: Request, res: Response) {
   // Generate authenticated session token
   const payload = JSON.stringify({ role: 'admin', t: Date.now(), rand: crypto.randomBytes(8).toString('hex') });
   const sessionToken = generateToken(payload);
-  activeSessions.add(sessionToken);
 
   res.cookie('openindex_token', sessionToken, {
     httpOnly: true,
@@ -114,11 +112,7 @@ export function handleCheckSession(req: Request, res: Response) {
 }
 
 export function handleLogout(req: Request, res: Response) {
-  const authHeader = req.headers.authorization;
-  const token = authHeader?.replace('Bearer ', '') || req.cookies?.openindex_token;
-  if (token) {
-    activeSessions.delete(token);
-  }
+  // Stateless token doesn't need explicit server-side deletion from memory
   res.clearCookie('openindex_token');
   return res.json({ success: true, message: 'Logged out successfully' });
 }

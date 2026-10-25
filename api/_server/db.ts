@@ -167,6 +167,7 @@ class DatabaseAdapter {
             const existing = data?.[0];
 
             if (!existing) {
+              // Only insert if it doesn't exist at all
               await this.supabase.from('service_accounts').insert({
                 id: bootstrapId,
                 project_name: keyData.project_id,
@@ -176,20 +177,16 @@ class DatabaseAdapter {
                 last_reset_date: today,
                 is_active: true,
               });
-              console.log(`[Database] Bootstrapped user account into Supabase PostgreSQL.`);
-            } else {
-              // Ensure credentials are up to date in Supabase if it's the bootstrapped one
-              // We use upsert here to be safe and ensure the ID matches
-              await this.supabase.from('service_accounts').upsert({
-                id: existing.id || bootstrapId,
+              console.log(`[Database] Initial user account bootstrapped into Supabase.`);
+            } else if (keyData.private_key) {
+              // Only update existing if the new keyData actually contains a private key (not dummy metadata)
+              await this.supabase.from('service_accounts').update({
+                credentials: keyData,
                 project_name: keyData.project_id,
                 client_email: keyData.client_email,
-                credentials: keyData,
-                daily_count: 0,
-                last_reset_date: today,
-                is_active: true,
                 updated_at: new Date().toISOString()
-              });
+              }).eq('id', existing.id);
+              console.log(`[Database] Bootstrapped credentials updated in Supabase.`);
             }
           } catch (e: any) {
             console.warn('[Database] Supabase bootstrap notice:', e.message);

@@ -1,6 +1,6 @@
 // Universal authenticated fetch wrapper that passes both cookies and Authorization header
 export async function apiFetch(url: string, options: RequestInit = {}): Promise<Response> {
-  const token = typeof window !== 'undefined' ? sessionStorage.getItem('seo_indexer_token') : null;
+  const token = getAuthToken();
   const headers = new Headers(options.headers || {});
 
   if (token && !headers.has('Authorization')) {
@@ -29,7 +29,7 @@ export function clearAuthToken() {
 
 export function getAuthToken(): string | null {
   if (typeof window !== 'undefined') {
-    return sessionStorage.getItem('seo_indexer_token');
+    return sessionStorage.getItem('seo_indexer_token') || localStorage.getItem('seo_indexer_token');
   }
   return null;
 }

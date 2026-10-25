@@ -56,12 +56,12 @@ apiRouter.get('/system/status', async (req: Request, res: Response) => {
   }
 });
 
-apiRouter.post('/system/config-supabase', requireAuth, (req: Request, res: Response) => {
+apiRouter.post('/system/config-supabase', requireAuth, async (req: Request, res: Response) => {
   const { url, key } = req.body;
   if (!url || !key) {
     return res.status(400).json({ error: 'Supabase URL and Key are required.' });
   }
-  const success = db.setCustomSupabaseConfig(url, key);
+  const success = await db.setCustomSupabaseConfig(url, key);
   return res.json({
     success,
     message: success

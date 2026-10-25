@@ -53,22 +53,6 @@ export default function App() {
     checkSession();
   }, [checkSession]);
 
-  // Tab refresh and close session auto-lock trigger
-  useEffect(() => {
-    const handleBeforeUnload = () => {
-      // Clear token so refreshing or closing the tab immediately locks the session
-      clearAuthToken();
-      try {
-        navigator.sendBeacon('/api/auth/logout');
-      } catch {}
-    };
-
-    window.addEventListener('beforeunload', handleBeforeUnload);
-    return () => {
-      window.removeEventListener('beforeunload', handleBeforeUnload);
-    };
-  }, []);
-
   // Inactivity auto-lock monitor (10 minutes)
   const handleLogout = useCallback(async (notice?: string) => {
     try {
