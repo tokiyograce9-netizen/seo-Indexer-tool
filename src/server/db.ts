@@ -1,29 +1,40 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
-import { Pool } from 'pg';
 import fs from 'fs';
 import path from 'path';
 import { ServiceAccount, UrlLog, SystemStatus } from '../lib/types';
 import crypto from 'crypto';
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
+// Detect Serverless environment (Vercel, AWS Lambda, Netlify)
+const isServerless = Boolean(
+  process.env.VERCEL ||
+  process.env.AWS_LAMBDA_FUNCTION_NAME ||
+  process.env.LAMBDA_TASK_ROOT ||
+  process.env.NETLIFY
+);
+
+// Safe storage directory: /tmp on serverless environments to prevent EROFS read-only filesystem crash
+const DATA_DIR = isServerless
+  ? path.resolve('/tmp', 'openindex-data')
+  : path.resolve(process.cwd(), 'data');
+
 const STORAGE_FILE = path.resolve(DATA_DIR, 'openindex-storage.json');
 const USER_KEY_FILE = path.resolve(DATA_DIR, 'credentials_e1123b8b.json');
 
-// Supabase credentials loaded securely from process.env (.env or hosting platform)
+// Supabase credentials loaded securely from process.env (.env or Vercel environment variables)
 const DEFAULT_SUPABASE_URL = process.env.SUPABASE_URL || '';
 const DEFAULT_SUPABASE_KEY =
   process.env.SUPABASE_SERVICE_ROLE_KEY ||
   process.env.SUPABASE_ANON_KEY ||
   '';
-const DEFAULT_DATABASE_URL = process.env.DATABASE_URL || '';
 
-// Ensure data folder exists
-if (!fs.existsSync(DATA_DIR)) {
-  try {
+// Ensure data folder exists safely
+try {
+  if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-  } catch (err) {
-    console.warn('Could not create data dir:', err);
   }
+} catch (err) {
+  // On read-only environments, continue gracefully with in-memory store
+  console.warn('[Database] Storage dir init notice (safe fallback active):', err);
 }
 
 interface LocalStore {
@@ -37,18 +48,17 @@ interface LocalStore {
 
 class DatabaseAdapter {
   private supabase: SupabaseClient | null = null;
-  private pgPool: Pool | null = null;
   private localStore: LocalStore = {
     service_accounts: [],
     url_logs: [],
   };
   private isConnectedToSupabase = false;
   private activeUrl: string | null = null;
+  private quotaLimitPerAccount: number = 200;
 
   constructor() {
-    this.loadLocalStore();
-    this.initPostgres();
     this.initSupabase();
+    this.loadLocalStore();
     this.bootstrapUserKey();
   }
 
@@ -64,76 +74,19 @@ class DatabaseAdapter {
           this.localStore.url_logs = [];
         }
       }
-    } catch (e) {
-      console.warn('Fallback storage load error, resetting memory store:', e);
+    } catch {
       this.localStore = { service_accounts: [], url_logs: [] };
     }
   }
 
   private saveLocalStore() {
     try {
-      fs.writeFileSync(STORAGE_FILE, JSON.stringify(this.localStore, null, 2), 'utf-8');
-    } catch (e) {
-      console.warn('Fallback storage write error:', e);
-    }
-  }
-
-  // Initialize PostgreSQL direct connection to execute DDL / bootstrap
-  private async initPostgres() {
-    if (!DEFAULT_DATABASE_URL) {
-      console.log('[PostgreSQL Pool] No DATABASE_URL provided. Operating in Supabase REST or local store mode.');
-      return;
-    }
-    try {
-      this.pgPool = new Pool({
-        connectionString: DEFAULT_DATABASE_URL,
-        ssl: { rejectUnauthorized: false },
-        connectionTimeoutMillis: 5000,
-      });
-
-      // Test connection and run schema creation if needed
-      const client = await this.pgPool.connect();
-      try {
-        await client.query(`
-          CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-
-          CREATE TABLE IF NOT EXISTS public.service_accounts (
-            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-            project_name TEXT NOT NULL,
-            client_email TEXT NOT NULL,
-            credentials JSONB NOT NULL,
-            daily_count INTEGER NOT NULL DEFAULT 0,
-            last_reset_date DATE NOT NULL DEFAULT CURRENT_DATE,
-            is_active BOOLEAN NOT NULL DEFAULT true,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
-          );
-
-          CREATE TABLE IF NOT EXISTS public.url_logs (
-            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-            url TEXT NOT NULL,
-            status TEXT NOT NULL,
-            notification_type TEXT NOT NULL DEFAULT 'URL_UPDATED',
-            http_code INTEGER,
-            used_account_id UUID,
-            used_project_name TEXT,
-            response_message TEXT,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
-          );
-
-          CREATE INDEX IF NOT EXISTS idx_service_accounts_active_quota 
-            ON public.service_accounts (is_active, daily_count, last_reset_date);
-          CREATE INDEX IF NOT EXISTS idx_url_logs_created_at 
-            ON public.url_logs (created_at DESC);
-        `);
-        console.log('[PostgreSQL] Connected to Supabase DB and verified schema.');
-        this.isConnectedToSupabase = true;
-      } finally {
-        client.release();
+      if (!fs.existsSync(DATA_DIR)) {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
       }
-    } catch (err: any) {
-      console.warn('[PostgreSQL Pool] Direct connection note:', err.message);
-      this.pgPool = null;
+      fs.writeFileSync(STORAGE_FILE, JSON.stringify(this.localStore, null, 2), 'utf-8');
+    } catch {
+      // In-memory store remains intact even if disk is read-only
     }
   }
 
@@ -148,7 +101,7 @@ class DatabaseAdapter {
         });
         this.activeUrl = url;
         this.isConnectedToSupabase = true;
-        console.log(`[Database] Supabase client initialized with ${url}`);
+        console.log(`[Database] Supabase client initialized via HTTPS REST with ${url}`);
         return true;
       } catch (err) {
         console.warn('[Database] Failed to init Supabase client:', err);
@@ -169,11 +122,17 @@ class DatabaseAdapter {
   public async bootstrapUserKey() {
     try {
       let keyData: any = null;
-      if (fs.existsSync(USER_KEY_FILE)) {
-        const raw = fs.readFileSync(USER_KEY_FILE, 'utf-8');
-        keyData = JSON.parse(raw);
-      } else {
-        // Fallback embedded key data
+
+      // 1. Check local key file if available
+      try {
+        if (fs.existsSync(USER_KEY_FILE)) {
+          const raw = fs.readFileSync(USER_KEY_FILE, 'utf-8');
+          keyData = JSON.parse(raw);
+        }
+      } catch {}
+
+      // 2. Fallback project metadata
+      if (!keyData) {
         keyData = {
           type: 'service_account',
           project_id: 'seo-automation-503206',
@@ -184,11 +143,36 @@ class DatabaseAdapter {
       if (keyData && keyData.project_id && keyData.client_email) {
         const today = this.getTodayDateString();
 
-        // Check if already in local store
+        // Check if already present in Supabase
+        if (this.supabase) {
+          try {
+            const { data } = await this.supabase
+              .from('service_accounts')
+              .select('id, project_name')
+              .eq('project_name', keyData.project_id)
+              .maybeSingle();
+
+            if (!data) {
+              await this.supabase.from('service_accounts').insert({
+                id: '50320600-0000-4000-8000-000000503206',
+                project_name: keyData.project_id,
+                client_email: keyData.client_email,
+                credentials: keyData,
+                daily_count: 0,
+                last_reset_date: today,
+                is_active: true,
+              });
+              console.log(`[Database] Bootstrapped user account into Supabase PostgreSQL.`);
+            }
+          } catch (e: any) {
+            console.warn('[Database] Supabase bootstrap notice:', e.message);
+          }
+        }
+
+        // Also preserve in local store
         const existingLocal = this.localStore.service_accounts.find(
           (a) => a.project_name === keyData.project_id || a.client_email === keyData.client_email
         );
-
         if (!existingLocal) {
           const userAccount: ServiceAccount = {
             id: '50320600-0000-4000-8000-000000503206',
@@ -202,34 +186,10 @@ class DatabaseAdapter {
           };
           this.localStore.service_accounts.unshift(userAccount);
           this.saveLocalStore();
-          console.log(`[Database] User key ${keyData.project_id} bootstrapped locally.`);
-        }
-
-        // Also save/upsert to Supabase if available
-        if (this.pgPool) {
-          try {
-            await this.pgPool.query(
-              `INSERT INTO public.service_accounts 
-               (id, project_name, client_email, credentials, daily_count, last_reset_date, is_active)
-               VALUES ($1, $2, $3, $4, 0, $5, true)
-               ON CONFLICT (id) DO UPDATE 
-               SET credentials = EXCLUDED.credentials, project_name = EXCLUDED.project_name, client_email = EXCLUDED.client_email;`,
-              [
-                '50320600-0000-4000-8000-000000503206',
-                keyData.project_id,
-                keyData.client_email,
-                JSON.stringify(keyData),
-                today,
-              ]
-            );
-            console.log(`[Database] User key ${keyData.project_id} stored in Supabase PostgreSQL.`);
-          } catch (e: any) {
-            console.warn('[Database] Note inserting user key to Postgres:', e.message);
-          }
         }
       }
     } catch (err: any) {
-      console.warn('[Database] Could not bootstrap user key:', err.message);
+      console.warn('[Database] Bootstrap notice:', err.message);
     }
   }
 
@@ -255,33 +215,7 @@ class DatabaseAdapter {
   public async getAccounts(): Promise<ServiceAccount[]> {
     const today = this.getTodayDateString();
 
-    // 1. Try Direct PostgreSQL Pool
-    if (this.pgPool) {
-      try {
-        const res = await this.pgPool.query(
-          `SELECT id, project_name, client_email, credentials, daily_count, last_reset_date, is_active, created_at 
-           FROM public.service_accounts 
-           ORDER BY created_at DESC;`
-        );
-        if (res.rows && res.rows.length > 0) {
-          const accounts: ServiceAccount[] = res.rows.map((row) => ({
-            id: row.id,
-            project_name: row.project_name,
-            client_email: row.client_email,
-            credentials: row.credentials,
-            daily_count: row.daily_count || 0,
-            last_reset_date: String(row.last_reset_date || today),
-            is_active: Boolean(row.is_active),
-            created_at: new Date(row.created_at).toISOString(),
-          }));
-          return accounts.map((a) => this.checkAndResetQuotas(a));
-        }
-      } catch (err: any) {
-        // Fall through to Supabase client or local
-      }
-    }
-
-    // 2. Try Supabase REST Client
+    // 1. Primary: Supabase REST API
     if (this.supabase) {
       try {
         const { data, error } = await this.supabase
@@ -289,15 +223,25 @@ class DatabaseAdapter {
           .select('*')
           .order('created_at', { ascending: false });
 
-        if (!error && data && data.length > 0) {
-          return data.map((a) => this.checkAndResetQuotas(a));
+        if (!error && Array.isArray(data) && data.length > 0) {
+          const accounts: ServiceAccount[] = data.map((row) => ({
+            id: row.id,
+            project_name: row.project_name,
+            client_email: row.client_email,
+            credentials: row.credentials,
+            daily_count: Number(row.daily_count || 0),
+            last_reset_date: String(row.last_reset_date || today),
+            is_active: Boolean(row.is_active),
+            created_at: row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString(),
+          }));
+          return accounts.map((a) => this.checkAndResetQuotas(a));
         }
-      } catch (e) {
-        // Fall through to local
+      } catch (err: any) {
+        console.warn('[Database] Supabase getAccounts notice:', err.message);
       }
     }
 
-    // 3. Local Fallback
+    // 2. Fallback: Local / Memory Store
     this.localStore.service_accounts = this.localStore.service_accounts.map((acc) =>
       this.checkAndResetQuotas(acc)
     );
@@ -306,26 +250,26 @@ class DatabaseAdapter {
   }
 
   public async getAccountById(id: string): Promise<ServiceAccount | null> {
-    if (this.pgPool) {
-      try {
-        const res = await this.pgPool.query(
-          `SELECT * FROM public.service_accounts WHERE id = $1 LIMIT 1;`,
-          [id]
-        );
-        if (res.rows[0]) {
-          return this.checkAndResetQuotas(res.rows[0]);
-        }
-      } catch {}
-    }
-
     if (this.supabase) {
       try {
-        const { data } = await this.supabase
+        const { data, error } = await this.supabase
           .from('service_accounts')
           .select('*')
           .eq('id', id)
-          .single();
-        if (data) return this.checkAndResetQuotas(data);
+          .maybeSingle();
+
+        if (!error && data) {
+          return this.checkAndResetQuotas({
+            id: data.id,
+            project_name: data.project_name,
+            client_email: data.client_email,
+            credentials: data.credentials,
+            daily_count: Number(data.daily_count || 0),
+            last_reset_date: String(data.last_reset_date || this.getTodayDateString()),
+            is_active: Boolean(data.is_active),
+            created_at: data.created_at || new Date().toISOString(),
+          });
+        }
       } catch {}
     }
 
@@ -356,26 +300,21 @@ class DatabaseAdapter {
       updated_at: new Date().toISOString(),
     };
 
-    if (this.pgPool) {
+    // Save to Supabase
+    if (this.supabase) {
       try {
-        await this.pgPool.query(
-          `INSERT INTO public.service_accounts 
-           (id, project_name, client_email, credentials, daily_count, last_reset_date, is_active)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)
-           ON CONFLICT (id) DO UPDATE 
-           SET credentials = EXCLUDED.credentials, project_name = EXCLUDED.project_name, client_email = EXCLUDED.client_email;`,
-          [
-            newAccount.id,
-            newAccount.project_name,
-            newAccount.client_email,
-            JSON.stringify(newAccount.credentials),
-            newAccount.daily_count,
-            newAccount.last_reset_date,
-            newAccount.is_active,
-          ]
-        );
+        await this.supabase.from('service_accounts').upsert({
+          id: newAccount.id,
+          project_name: newAccount.project_name,
+          client_email: newAccount.client_email,
+          credentials: newAccount.credentials,
+          daily_count: newAccount.daily_count,
+          last_reset_date: newAccount.last_reset_date,
+          is_active: newAccount.is_active,
+          updated_at: newAccount.updated_at,
+        });
       } catch (err: any) {
-        console.warn('Postgres insert note:', err.message);
+        console.warn('[Database] Supabase saveAccount notice:', err.message);
       }
     }
 
@@ -394,43 +333,15 @@ class DatabaseAdapter {
     const now = new Date().toISOString();
     const fullUpdates = { ...updates, updated_at: now };
 
-    if (this.pgPool) {
+    if (this.supabase) {
       try {
-        const fields: string[] = [];
-        const vals: any[] = [];
-        let i = 1;
-        if (updates.project_name !== undefined) {
-          fields.push(`project_name = $${i++}`);
-          vals.push(updates.project_name);
-        }
-        if (updates.client_email !== undefined) {
-          fields.push(`client_email = $${i++}`);
-          vals.push(updates.client_email);
-        }
-        if (updates.credentials !== undefined) {
-          fields.push(`credentials = $${i++}`);
-          vals.push(JSON.stringify(updates.credentials));
-        }
-        if (updates.is_active !== undefined) {
-          fields.push(`is_active = $${i++}`);
-          vals.push(updates.is_active);
-        }
-        if (updates.daily_count !== undefined) {
-          fields.push(`daily_count = $${i++}`);
-          vals.push(updates.daily_count);
-        }
-        if (updates.last_reset_date !== undefined) {
-          fields.push(`last_reset_date = $${i++}`);
-          vals.push(updates.last_reset_date);
-        }
-        if (fields.length > 0) {
-          vals.push(id);
-          await this.pgPool.query(
-            `UPDATE public.service_accounts SET ${fields.join(', ')} WHERE id = $${i};`,
-            vals
-          );
-        }
-      } catch {}
+        await this.supabase
+          .from('service_accounts')
+          .update(fullUpdates)
+          .eq('id', id);
+      } catch (err: any) {
+        console.warn('[Database] Supabase updateAccount notice:', err.message);
+      }
     }
 
     const index = this.localStore.service_accounts.findIndex((a) => a.id === id);
@@ -463,10 +374,12 @@ class DatabaseAdapter {
   }
 
   public async deleteAccount(id: string): Promise<boolean> {
-    if (this.pgPool) {
+    if (this.supabase) {
       try {
-        await this.pgPool.query(`DELETE FROM public.service_accounts WHERE id = $1;`, [id]);
-      } catch {}
+        await this.supabase.from('service_accounts').delete().eq('id', id);
+      } catch (err: any) {
+        console.warn('[Database] Supabase deleteAccount notice:', err.message);
+      }
     }
 
     const initialLen = this.localStore.service_accounts.length;
@@ -488,23 +401,21 @@ class DatabaseAdapter {
       created_at: new Date().toISOString(),
     };
 
-    if (this.pgPool) {
+    if (this.supabase) {
       try {
-        await this.pgPool.query(
-          `INSERT INTO public.url_logs 
-           (id, url, status, notification_type, http_code, used_project_name, response_message)
-           VALUES ($1, $2, $3, $4, $5, $6, $7);`,
-          [
-            newLog.id,
-            newLog.url,
-            newLog.status,
-            newLog.notification_type,
-            newLog.http_code,
-            newLog.used_project_name,
-            newLog.response_message,
-          ]
-        );
-      } catch {}
+        await this.supabase.from('url_logs').insert({
+          id: newLog.id,
+          url: newLog.url,
+          status: newLog.status,
+          notification_type: newLog.notification_type,
+          http_code: newLog.http_code,
+          used_project_name: newLog.used_project_name,
+          response_message: newLog.response_message,
+          created_at: newLog.created_at,
+        });
+      } catch (err: any) {
+        console.warn('[Database] Supabase addUrlLog notice:', err.message);
+      }
     }
 
     this.localStore.url_logs.unshift(newLog);
@@ -516,25 +427,25 @@ class DatabaseAdapter {
   }
 
   public async getUrlLogs(limit = 100, statusFilter?: string, search?: string): Promise<UrlLog[]> {
-    if (this.pgPool) {
+    if (this.supabase) {
       try {
-        let sql = `SELECT * FROM public.url_logs WHERE 1=1`;
-        const params: any[] = [];
-        let i = 1;
-        if (statusFilter && statusFilter !== 'ALL') {
-          sql += ` AND status = $${i++}`;
-          params.push(statusFilter);
-        }
-        if (search) {
-          sql += ` AND (url ILIKE $${i++} OR used_project_name ILIKE $${i++})`;
-          params.push(`%${search}%`, `%${search}%`);
-        }
-        sql += ` ORDER BY created_at DESC LIMIT $${i};`;
-        params.push(limit);
+        let query = this.supabase
+          .from('url_logs')
+          .select('*')
+          .order('created_at', { ascending: false })
+          .limit(limit);
 
-        const res = await this.pgPool.query(sql, params);
-        if (res.rows && res.rows.length > 0) {
-          return res.rows.map((r) => ({
+        if (statusFilter && statusFilter !== 'ALL') {
+          query = query.eq('status', statusFilter);
+        }
+
+        if (search) {
+          query = query.or(`url.ilike.%${search}%,used_project_name.ilike.%${search}%`);
+        }
+
+        const { data, error } = await query;
+        if (!error && Array.isArray(data)) {
+          return data.map((r) => ({
             id: r.id,
             url: r.url,
             status: r.status,
@@ -543,10 +454,12 @@ class DatabaseAdapter {
             used_account_id: r.used_account_id,
             used_project_name: r.used_project_name,
             response_message: r.response_message,
-            created_at: new Date(r.created_at).toISOString(),
+            created_at: r.created_at ? new Date(r.created_at).toISOString() : new Date().toISOString(),
           }));
         }
-      } catch {}
+      } catch (err: any) {
+        console.warn('[Database] Supabase getUrlLogs notice:', err.message);
+      }
     }
 
     let logs = [...this.localStore.url_logs];
@@ -565,16 +478,19 @@ class DatabaseAdapter {
   }
 
   public async clearLogs(): Promise<void> {
-    if (this.pgPool) {
+    if (this.supabase) {
       try {
-        await this.pgPool.query(`TRUNCATE TABLE public.url_logs;`);
-      } catch {}
+        await this.supabase
+          .from('url_logs')
+          .delete()
+          .neq('id', '00000000-0000-0000-0000-000000000000');
+      } catch (err: any) {
+        console.warn('[Database] Supabase clearLogs notice:', err.message);
+      }
     }
     this.localStore.url_logs = [];
     this.saveLocalStore();
   }
-
-  private quotaLimitPerAccount: number = 200;
 
   public setQuotaLimit(limit: number): number {
     this.quotaLimitPerAccount = limit === 100 ? 100 : 200;
@@ -603,8 +519,8 @@ class DatabaseAdapter {
       totalDailyQuota,
       usedDailyQuota,
       remainingDailyQuota,
-      adminPasswordConfigured: true,
-      defaultOtpConfigured: true,
+      adminPasswordConfigured: Boolean(process.env.ADMIN_PASSWORD),
+      defaultOtpConfigured: Boolean(process.env.OTP_CODE),
     };
   }
 

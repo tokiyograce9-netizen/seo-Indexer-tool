@@ -389,4 +389,13 @@ app.all('/api/*', (req: Request, res: Response) => {
   res.status(404).json({ error: `API route not found: ${req.method} ${req.originalUrl || req.url}` });
 });
 
+// Global Express Error Handler
+app.use((err: any, req: Request, res: Response, next: any) => {
+  console.error('[Global Server Error]:', err);
+  if (res.headersSent) return next(err);
+  return res.status(err.status || err.statusCode || 500).json({
+    error: err?.message || 'Internal Server Error',
+  });
+});
+
 export default app;

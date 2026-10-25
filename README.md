@@ -41,14 +41,14 @@ The PostgreSQL schema consists of two tables defined in `schema.sql`:
 ## Quick Start (Local & AI Studio)
 
 1. **Install dependencies**:
-   \`\`\`bash
+   ```bash
    npm install
-   \`\`\`
+   ```
 
 2. **Run Dev Server**:
-   \`\`\`bash
+   ```bash
    npm run dev
-   \`\`\`
+   ```
    Server starts at `http://localhost:3000`.
 
 3. **Log in**:
